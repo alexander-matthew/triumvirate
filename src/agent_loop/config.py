@@ -13,34 +13,68 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def project_root() -> Path:
-    """Where the loop is being run against.
+def config_root() -> Path:
+    """Where the loop reads its config + personas + state from.
 
-    Order of precedence:
-      1. AGENT_LOOP_PROJECT_ROOT env var (absolute path)
-      2. Walk up from cwd looking for `agents/config.toml`
-      3. Cwd itself
+    Two valid layouts:
 
-    The systemd unit explicitly sets the env var so daemon runs are
-    deterministic; interactive `agent-loop tick` finds the project by
-    walking up.
+    A. Co-located (older — used by personal-site initially).
+       The git repo and the loop config live in the same tree:
+         <repo>/
+           agents/config.toml
+           agents/personas/
+           agents/state/
+       Config-root == project-root.
+
+    B. Split (preferred for shared hosts / multi-project users).
+       Loop config lives in its own directory, often a dedicated repo:
+         agent-loop-configs/
+           <project>/
+             config.toml
+             personas/
+             state/
+             systemd/
+       Config-root is `agent-loop-configs/<project>/`; project-root is
+       whatever `[project].git_root` says in config.toml.
+
+    Discovery order:
+      1. AGENT_LOOP_CONFIG_ROOT env var (preferred — set by systemd unit)
+      2. AGENT_LOOP_PROJECT_ROOT env var (backwards compat — old layout)
+      3. Walk up from cwd looking for `config.toml`
+      4. Walk up from cwd looking for `agents/config.toml` (old layout)
+      5. Cwd itself
     """
+    env = os.environ.get("AGENT_LOOP_CONFIG_ROOT")
+    if env:
+        return Path(env).resolve()
     env = os.environ.get("AGENT_LOOP_PROJECT_ROOT")
     if env:
         return Path(env).resolve()
     cwd = Path.cwd().resolve()
     for d in (cwd, *cwd.parents):
+        if (d / "config.toml").exists():
+            return d
         if (d / "agents" / "config.toml").exists():
             return d
     return cwd
+
+
+def project_root() -> Path:
+    """Back-compat alias. Resolves to config_root unless a Settings instance
+    is loaded — then callers should prefer `settings().project_root`."""
+    return config_root()
 
 
 @dataclass(frozen=True)
 class Settings:
     """All per-project configuration. Frozen — instantiate once, pass around."""
 
+    # --- locations ---
+    config_root: Path               # where config.toml, personas/, state/ live
+    config_file: Path               # exact config.toml path (for STOP placement)
+    project_root: Path              # where the git repo lives (== config_root in old layout)
+
     # --- project identity ---
-    project_root: Path
     project_name: str
     repo: str                       # "owner/name" — passed to gh commands implicitly via repo cwd
     trusted_authors: frozenset[str]
@@ -79,7 +113,10 @@ class Settings:
 
     @property
     def stop_path(self) -> Path:
-        return self.project_root / "agents" / "STOP"
+        # STOP lives next to config.toml — so it's at `agents/STOP` in the
+        # old co-located layout and at `<config_root>/STOP` in the split
+        # layout. Either way, "next to config.toml" is the stable reference.
+        return self.config_file.parent / "STOP"
 
     @property
     def worktrees_dir(self) -> Path:
@@ -116,9 +153,15 @@ _DEFAULT_LABELS = {
 
 def load(config_path: Path | None = None) -> Settings:
     """Load Settings from `config_path` (or auto-discover under project_root)."""
-    root = project_root()
+    cfg_root = config_root()
     if config_path is None:
-        config_path = root / "agents" / "config.toml"
+        # Prefer the split layout (config.toml at root); fall back to the
+        # old co-located layout (agents/config.toml).
+        candidate = cfg_root / "config.toml"
+        if candidate.exists():
+            config_path = candidate
+        else:
+            config_path = cfg_root / "agents" / "config.toml"
     if not config_path.exists():
         raise FileNotFoundError(
             f"agent-loop config not found at {config_path}. "
@@ -135,12 +178,26 @@ def load(config_path: Path | None = None) -> Settings:
     reviewers = data.get("reviewers", {})
     labels = data.get("labels", {})
 
-    personas_dir = root / paths.get("personas_dir", "agents/personas")
-    state_dir = root / paths.get("state_dir", "agents/state")
+    # project_root: where the git repo lives. May be different from cfg_root
+    # in the split layout. Default to cfg_root for backwards compat.
+    git_root_raw = proj.get("git_root")
+    proj_root = Path(git_root_raw).resolve() if git_root_raw else cfg_root
+
+    # Path defaults differ by layout. If config.toml is at <cfg_root>/config.toml
+    # (split layout), defaults drop the "agents/" prefix. If it's at
+    # <cfg_root>/agents/config.toml (old layout), defaults keep "agents/".
+    is_split_layout = config_path.parent == cfg_root
+    default_personas = "personas" if is_split_layout else "agents/personas"
+    default_state = "state" if is_split_layout else "agents/state"
+
+    personas_dir = cfg_root / paths.get("personas_dir", default_personas)
+    state_dir = cfg_root / paths.get("state_dir", default_state)
 
     return Settings(
-        project_root=root,
-        project_name=proj.get("name", root.name),
+        config_root=cfg_root,
+        config_file=config_path.resolve(),
+        project_root=proj_root,
+        project_name=proj.get("name", proj_root.name),
         repo=proj.get("repo", ""),
         trusted_authors=frozenset(a.lower() for a in proj.get("trusted_authors", [])),
         off_hours_start=int(proj.get("off_hours_start", 23)),
