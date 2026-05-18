@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 
 from ..config import settings
-from ..lib import db, gh, kill_switch, protected, rotation
+from ..lib import db, gh, kill_switch, protected, review_baton, rotation
 
 
 def _ci_state(pr: dict) -> str:
@@ -113,4 +113,5 @@ def evaluate(pr_number: int) -> int:
 
     db.append(phase="merge", action="finish", pr_number=pr_number,
               outcome="merged", duration_s=time.time() - started)
+    review_baton.clear(pr_number)
     return 0
