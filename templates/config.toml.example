@@ -1,0 +1,97 @@
+# Per-project agent-loop configuration.
+#
+# Copy this file to `agents/config.toml` in your project root and edit
+# for your specifics. The framework code consults these values instead of
+# holding any project-specific constants.
+
+[project]
+name = "personal-site"
+repo = "alexander-matthew/personal-site"     # "owner/repo"
+trusted_authors = ["alexander-matthew"]
+
+# Off-hours window in 24h local time. The engineer / proposer / triage /
+# drift_watcher phases refuse to run outside this window. Reviewer /
+# arbiter / merge_gate are not gated (they don't consume the heavy
+# engineer budget).
+off_hours_start = 23     # 11pm
+off_hours_end   = 6      # 6am
+
+# Daemon polls GitHub state every TICK_SECONDS while it's up.
+tick_seconds = 60
+
+
+[guards]
+# Diff exceeding this many additions+deletions auto-fails review.
+max_diff_loc = 400
+
+# Max reviewer rounds per PR before the arbiter takes over.
+max_review_rounds = 3
+
+# Files the engineer/responder must never modify. Touch one → PR is auto-
+# flagged with `agent:protected-violation` + `agent:needs-human`.
+protected_paths = [
+    ".github/workflows/",
+    "infra/",
+    "agents/scripts/",        # legacy; safe to remove if you migrated
+    "agents/personas/",
+    "agents/config.toml",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.homelab.yml",
+    "app/services/oauth.py",
+]
+
+
+[security]
+# PRs touching any of these paths trigger an extra pre-merge security
+# review by the `security` persona (Gemini, adversarial pass).
+sensitive_path_prefixes = [
+    "app/services/oauth.py",
+    "app/services/rate_limit.py",
+    "app/services/cache.py",
+    "app/__init__.py",
+    "app/templating.py",
+]
+
+
+[librarian]
+# PRs touching any of these paths trigger a cross-project consistency
+# audit by the `librarian-gemini` persona. Empty = librarian disabled.
+trigger_paths = [
+    "pyproject.toml",
+    "package.json",
+    "uv.lock",
+    "package-lock.json",
+    ".devcontainer/",
+    "app/services/",
+]
+
+
+[reviewers]
+# CLIs that must each independently APPROVE the latest commit for a PR
+# to be eligible for merge. Order doesn't matter.
+required_clis = ["codex", "gemini"]
+
+
+[paths]
+# Project-relative paths the framework expects.
+personas_dir = "agents/personas"
+state_dir    = "agents/state"
+
+
+[labels]
+# Override any logical-label-name → GitHub-label-string mapping here.
+# Defaults are:
+#   approved = "agent:approved"
+#   in_progress = "agent:in-progress"
+#   proposal = "agent:proposal"
+#   halt = "agent:halt"
+#   veto = "agent:veto"
+#   needs_human = "agent:needs-human"
+#   protected_violation = "agent:protected-violation"
+#   too_large = "agent:too-large"
+#   authored_by_claude = "agent:authored-by-claude"
+#   security_cleared = "agent:security-cleared"
+#   security_flag = "agent:security-flag"
+#   librarian_cleared = "agent:librarian-cleared"
+#   librarian_flag = "agent:librarian-flag"

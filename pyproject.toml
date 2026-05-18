@@ -1,0 +1,42 @@
+[project]
+name = "agent-loop"
+version = "0.1.0"
+description = "Autonomous engineering loop — Claude/Codex/Gemini consensus PR review on the host that runs systemd."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "alexander-matthew" }]
+keywords = ["agents", "llm", "claude", "codex", "gemini", "automation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Build Tools",
+]
+
+# Runtime deps deliberately minimal. The agents talk via subprocess (gh, claude,
+# codex, gemini CLIs). No SDK clients here — that's the whole point.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+agent-loop = "agent_loop.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/alexander-matthew/triumvirate"
+Repository = "https://github.com/alexander-matthew/triumvirate"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_loop"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

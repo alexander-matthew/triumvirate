@@ -1,0 +1,28 @@
+name: Renew interaction limit
+
+# Public-repo guardrail. Sets collaborators_only every month so outside users
+# can read but cannot open issues, comment, or review. Backstop against
+# prompt-injection from strangers reaching the agent loop (even though
+# triumvirate itself isn't directly consumed by an agent loop, it's a public
+# repo about agent loops, so it benefits from the same posture).
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"  # 06:00 UTC on the 1st of every month
+  workflow_dispatch:
+
+permissions:
+  administration: write
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-apply collaborators_only interaction limit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/interaction-limits" \
+            -X PUT \
+            -f limit=collaborators_only \
+            -f expiry=six_months

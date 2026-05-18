@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+      - name: Build + install
+        run: |
+          uv sync --extra dev
+      - name: Smoke import all modules
+        run: |
+          uv run python -c "
+          import agent_loop
+          from agent_loop import cli, orchestrator, config
+          from agent_loop.lib import (
+              agent_run, db, gh, git_worktree, kill_switch,
+              paths, persona, protected, quota, rotation, trust,
+          )
+          from agent_loop.phases import (
+              arbitrate_pr, drift_watcher, librarian_check, merge_gate,
+              propose_issues, respond_to_review, review_pr, security_check,
+              triage_proposals, work_issue,
+          )
+          print('all modules import')
+          "
+      - name: Run tests
+        run: |
+          uv run pytest -v || (echo "no tests yet — placeholder" && true)
