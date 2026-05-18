@@ -110,18 +110,20 @@ def record(rl: RateLimit) -> None:
 
 def is_blocked(cli: str) -> tuple[bool, float | None]:
     """Returns (blocked, retry_after_ts). Reads the most recent rate-limit
-    event for `cli` from the project's runs.sqlite."""
-    conn = sqlite3.connect(settings().db_path, timeout=5)
-    conn.row_factory = sqlite3.Row
-    try:
+    event for `cli` from the project's runs.sqlite.
+
+    Uses `db._connect()` to ensure the schema is created on first use —
+    otherwise a fresh project (no events yet) would crash on
+    `OperationalError: no such table: events`.
+    """
+    from . import db  # local import to avoid cycle
+    with db._connect() as conn:
         row = conn.execute(
             "SELECT notes FROM events "
             "WHERE phase='quota' AND agent=? AND action='rate_limited' "
             "ORDER BY ts DESC LIMIT 1",
             (cli,),
         ).fetchone()
-    finally:
-        conn.close()
     if not row or not row["notes"]:
         return False, None
     try:

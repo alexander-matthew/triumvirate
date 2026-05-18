@@ -92,15 +92,13 @@ def pick_reviewer_cli(pr_number: int) -> str | None:
         return armed[0]
 
     def total_reviews(cli: str) -> int:
-        conn = sqlite3.connect(settings().db_path, timeout=5)
-        try:
+        from . import db  # avoid cycle
+        with db._connect() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE phase='review' AND action='finish' AND agent=?",
                 (cli,)
             ).fetchone()
             return row[0] if row else 0
-        finally:
-            conn.close()
 
     return min(armed, key=total_reviews)
 
