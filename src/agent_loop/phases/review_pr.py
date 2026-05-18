@@ -12,7 +12,17 @@ import time
 from pathlib import Path
 
 from ..config import settings
-from ..lib import agent_run, db, gh, git_worktree, kill_switch, protected, quota, rotation
+from ..lib import (
+    agent_run,
+    db,
+    gh,
+    git_worktree,
+    kill_switch,
+    protected,
+    quota,
+    review_baton,
+    rotation,
+)
 from ..lib.persona import Persona
 
 
@@ -58,8 +68,96 @@ def _extract_issue_ref(pr_body: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _build_prompt(persona: Persona, pr: dict, issue_body: str) -> str:
-    return persona.render(
+def _head_sha(pr: dict) -> str:
+    commits = pr.get("commits") or []
+    if not commits:
+        return ""
+    return commits[-1].get("oid") or ""
+
+
+def _delta_diff(worktree: Path, previous_head: str, current_head: str) -> str:
+    if not previous_head or not current_head or previous_head == current_head:
+        return ""
+    stat = subprocess.run(
+        ["git", "diff", "--stat", f"{previous_head}..{current_head}"],
+        cwd=worktree, capture_output=True, text=True,
+    )
+    diff = subprocess.run(
+        ["git", "diff", "--find-renames", f"{previous_head}..{current_head}"],
+        cwd=worktree, capture_output=True, text=True,
+    )
+    if stat.returncode != 0 or diff.returncode != 0:
+        return ""
+    return (stat.stdout.strip() + "\n\n" + diff.stdout.strip()).strip()
+
+
+def _matches_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
+
+
+def _wrapper_facts(
+    pr: dict,
+    *,
+    head_sha: str,
+    changed: list[str],
+    bad_paths: list[str],
+    too_large: bool,
+) -> str:
+    s = settings()
+    labels = sorted(l.get("name", "") for l in pr.get("labels", []) if l.get("name"))
+    sensitive = sorted(
+        p for p in changed
+        if _matches_prefix(p, s.sensitive_path_prefixes)
+    )
+    trigger_paths = sorted(
+        p for p in changed
+        if _matches_prefix(p, s.librarian_trigger_paths)
+    )
+    adds = pr.get("additions", 0)
+    dels = pr.get("deletions", 0)
+    mergeable = pr.get("mergeable") or "unknown"
+    ci_items = pr.get("statusCheckRollup") or []
+    ci_summary = ", ".join(
+        filter(None, [
+            str(item.get("name") or item.get("workflowName") or item.get("context") or "").strip()
+            for item in ci_items[:8]
+        ])
+    ) or "none reported"
+
+    lines = [
+        "## Wrapper-Computed Review Facts",
+        "",
+        "These facts were computed by the loop before invoking you. Treat them",
+        "as inputs to your review, not as a substitute for judgment.",
+        "",
+        f"- Head SHA: `{head_sha or 'unknown'}`",
+        f"- Diff size: +{adds}/-{dels} ({adds + dels} LOC), cap {s.max_diff_loc}: "
+        f"{'over cap' if too_large else 'within cap'}",
+        f"- Changed files ({len(changed)}):",
+        *[f"  - `{p}`" for p in changed[:30]],
+    ]
+    if len(changed) > 30:
+        lines.append(f"  - ... {len(changed) - 30} more")
+    lines.extend([
+        f"- Protected path violations: {', '.join(f'`{p}`' for p in bad_paths) if bad_paths else 'none'}",
+        f"- Sensitive paths touched: {', '.join(f'`{p}`' for p in sensitive) if sensitive else 'none'}",
+        f"- Librarian trigger paths touched: {', '.join(f'`{p}`' for p in trigger_paths) if trigger_paths else 'none'}",
+        f"- PR labels: {', '.join(f'`{label}`' for label in labels) if labels else 'none'}",
+        f"- Mergeable: `{mergeable}`",
+        f"- Status checks seen: {ci_summary}",
+    ])
+    return "\n".join(lines)
+
+
+def _build_prompt(
+    persona: Persona,
+    pr: dict,
+    issue_body: str,
+    *,
+    wrapper_facts: str = "",
+    baton_context: str = "",
+) -> str:
+    prompt = persona.render(
         PR_NUMBER=pr["number"],
         PR_TITLE=pr["title"],
         ISSUE_NUMBER=_extract_issue_ref(pr.get("body") or "") or "?",
@@ -69,6 +167,24 @@ def _build_prompt(persona: Persona, pr: dict, issue_body: str) -> str:
         PR_BODY=pr.get("body") or "",
         ISSUE_BODY=issue_body,
     )
+    if wrapper_facts:
+        prompt += (
+            "\n\n---\n\n"
+            f"{wrapper_facts}\n"
+        )
+    if baton_context:
+        prompt += (
+            "\n\n---\n\n"
+            "## Runtime Optimization Context\n\n"
+            "This is a follow-up review in the same PR review cycle. Keep the "
+            "same review standards as usual, but use this addendum to avoid "
+            "rediscovering unchanged context. If a delta diff is present, review "
+            "that first and only reopen the full branch diff where the delta, "
+            "baton, or checklist points to unresolved risk. Do not rubber-stamp "
+            "another reviewer if you disagree.\n\n"
+            f"{baton_context}\n"
+        )
+    return prompt
 
 
 def review(pr_number: int, *, cli: str | None = None) -> int:
@@ -102,8 +218,8 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
     adds = pr.get("additions", 0)
     dels = pr.get("deletions", 0)
     too_large = (adds + dels) > s.max_diff_loc
-    changed = [f.get("path") for f in (pr.get("files") or [])]
-    bad_paths = protected.violations([p for p in changed if p])
+    changed = [p for p in (f.get("path") for f in (pr.get("files") or [])) if p]
+    bad_paths = protected.violations(changed)
 
     db.append(phase="review", action="start", agent=persona.cli,
               pr_number=pr_number, notes={"round": round_n, "persona": persona.name})
@@ -125,7 +241,30 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
             except Exception:
                 pass
 
-        prompt = _build_prompt(persona, pr, issue_body)
+        current_head = _head_sha(pr)
+        prior_head = review_baton.latest_head_sha(pr_number)
+        baton_context = ""
+        if review_baton.has_reviews(pr_number):
+            baton_context = review_baton.render(
+                pr_number,
+                current_head=current_head,
+                delta_diff=_delta_diff(worktree, prior_head or "", current_head),
+            )
+
+        wrapper_facts = _wrapper_facts(
+            pr,
+            head_sha=current_head,
+            changed=changed,
+            bad_paths=bad_paths,
+            too_large=too_large,
+        )
+        prompt = _build_prompt(
+            persona,
+            pr,
+            issue_body,
+            wrapper_facts=wrapper_facts,
+            baton_context=baton_context,
+        )
         run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
 
         if run_.rate_limited:
@@ -190,6 +329,20 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
                   verdict=verdict_to_flag[enforced_verdict],
                   body=review_body)
 
+        review_baton.append_review(
+            pr_number=pr_number,
+            head_sha=current_head,
+            reviewer=persona.cli,
+            round_n=round_n,
+            verdict=enforced_verdict,
+            summary=parsed["summary"],
+            checklist=parsed["checklist"],
+            notes=parsed["notes"],
+            additions=adds,
+            deletions=dels,
+            changed_files=pr.get("changedFiles", 0),
+        )
+
         db.append(phase="review", action="finish", agent=persona.cli,
                   pr_number=pr_number, duration_s=run_.duration_s,
                   outcome=enforced_verdict.lower(),
@@ -198,6 +351,8 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
                          "enforced_verdict": enforced_verdict,
                          "protected_violations": bad_paths,
                          "too_large": too_large,
+                         "baton_used": bool(baton_context),
+                         "head_sha": current_head,
                          "persona": persona.name})
         return 0
 
