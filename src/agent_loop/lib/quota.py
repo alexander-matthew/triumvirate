@@ -144,3 +144,17 @@ def gate_message(cli: str) -> str:
         return f"{cli}: armed"
     iso = dt.datetime.fromtimestamp(ts).strftime("%H:%M")
     return f"{cli}: rate-limited until {iso}"
+
+
+def earliest_retry_after(clis: list[str]) -> float | None:
+    """Smallest `retry_after_ts` across the supplied CLIs that are currently
+    blocked. Returns None if none are blocked. Used by the daemon to extend
+    its sleep when every relevant persona is quota-gated — without this, the
+    loop wakes every `tick_seconds` only to no-op for the full retry window.
+    """
+    soonest: float | None = None
+    for cli in clis:
+        blocked, ts = is_blocked(cli)
+        if blocked and ts is not None and (soonest is None or ts < soonest):
+            soonest = ts
+    return soonest
