@@ -317,11 +317,43 @@ def daemon() -> int:
 
         one_tick()
 
+        sleep_target = _next_sleep_seconds(s.tick_seconds)
         slept = 0
-        while slept < s.tick_seconds and not _should_stop:
-            time.sleep(min(5, s.tick_seconds - slept))
+        while slept < sleep_target and not _should_stop:
+            time.sleep(min(5, sleep_target - slept))
             slept += 5
 
     db.append(phase="tick", action="daemon_exit",
               notes={"sigterm": _should_stop})
     return 0
+
+
+# All CLIs the loop ever dispatches. If all three are quota-blocked, the next
+# `_dispatch` call will return noop on every tick — extend the sleep instead.
+_KNOWN_CLIS = ("claude", "codex", "gemini")
+_MAX_ADAPTIVE_SLEEP_S = 30 * 60  # cap a single sleep window at 30min so
+                                  # kill-switch / sigterm stay responsive.
+
+
+def _next_sleep_seconds(default_s: int) -> int:
+    """If every persona is quota-blocked, sleep until the earliest unblock
+    (capped at 30min). Otherwise the normal tick interval.
+
+    Costs nothing when CLIs are armed — `earliest_retry_after` returns None
+    and we fall through to `default_s`.
+    """
+    soonest = quota.earliest_retry_after(list(_KNOWN_CLIS))
+    if soonest is None:
+        return default_s
+    # All three blocked? If even one is armed, default tick is fine — there
+    # may be useful work this tick.
+    if not all(quota.is_blocked(cli)[0] for cli in _KNOWN_CLIS):
+        return default_s
+    wait = int(soonest - time.time())
+    if wait <= default_s:
+        return default_s
+    capped = min(wait, _MAX_ADAPTIVE_SLEEP_S)
+    db.append(phase="tick", action="adaptive_sleep",
+              outcome="all_quota_blocked",
+              notes={"sleep_s": capped, "retry_after_ts": soonest})
+    return capped

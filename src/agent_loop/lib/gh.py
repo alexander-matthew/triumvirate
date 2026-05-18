@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+import time
 from typing import Any
 
 
@@ -10,16 +12,44 @@ class GhError(RuntimeError):
     pass
 
 
+# Patterns in `gh` stderr that indicate a transient failure worth retrying.
+# A single 401 blip killed the agentdeck loop overnight; backoff stops that.
+_TRANSIENT = re.compile(
+    r"\b(HTTP\s*(401|403|429|500|502|503|504)"
+    r"|connection\s+reset"
+    r"|temporarily\s+unavailable"
+    r"|i/o\s+timeout"
+    r"|tls\s+handshake)\b",
+    re.I,
+)
+
+# Tunable for tests. Production wait sequence: 1s, 3s, 9s (~13s worst case).
+_RETRY_DELAYS_S: tuple[float, ...] = (1.0, 3.0, 9.0)
+
+
+def _is_transient(stderr: str) -> bool:
+    return bool(_TRANSIENT.search(stderr or ""))
+
+
 def _run(args: list[str], *, check: bool = True, input_: str | None = None) -> str:
-    proc = subprocess.run(
-        ["gh", *args],
-        capture_output=True,
-        text=True,
-        input=input_,
-    )
-    if check and proc.returncode != 0:
-        raise GhError(f"gh {' '.join(args)}: {proc.stderr.strip()}")
-    return proc.stdout
+    last_stderr = ""
+    for attempt in range(len(_RETRY_DELAYS_S) + 1):
+        proc = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            input=input_,
+        )
+        if proc.returncode == 0:
+            return proc.stdout
+        last_stderr = proc.stderr
+        if not check:
+            return proc.stdout
+        if attempt < len(_RETRY_DELAYS_S) and _is_transient(last_stderr):
+            time.sleep(_RETRY_DELAYS_S[attempt])
+            continue
+        break
+    raise GhError(f"gh {' '.join(args)}: {last_stderr.strip()}")
 
 
 def _run_json(args: list[str]) -> Any:

@@ -73,7 +73,8 @@ def run() -> int:
                       notes={"stdout_tail": run_.stdout[-500:]})
             return 1
 
-        filed = []
+        filed: list[int] = []
+        errors: list[str] = []
         for p in proposals[:3]:
             labels = [s.label("proposal")] + p["labels"]
             try:
@@ -87,13 +88,23 @@ def run() -> int:
                 num = int(out.strip().rsplit("/", 1)[-1])
                 filed.append(num)
             except Exception as e:
+                errors.append(f"{p['title']}: {e!r}")
                 db.append(phase="propose", action="error", agent=persona.cli,
                           notes={"error": repr(e), "title": p["title"]})
 
-        db.append(phase="propose", action="finish", agent=persona.cli,
-                  duration_s=duration, outcome="filed",
-                  notes={"issues": filed, "count": len(filed)})
-        return 0 if filed else 1
+        if filed:
+            db.append(phase="propose", action="finish", agent=persona.cli,
+                      duration_s=duration, outcome="filed",
+                      notes={"issues": filed, "count": len(filed),
+                             "errors": errors or None})
+            return 0
+        # Every `gh issue create` failed; surface as an error not a successful
+        # zero-count finish. Without this the loop silently logs `count=0` and
+        # the operator has no signal that anything went wrong.
+        db.append(phase="propose", action="error", agent=persona.cli,
+                  duration_s=duration, outcome="all_creates_failed",
+                  notes={"attempted": len(proposals[:3]), "errors": errors})
+        return 2
 
     except kill_switch.HaltRequested as e:
         db.append(phase="propose", action="halted", agent=persona.cli,
