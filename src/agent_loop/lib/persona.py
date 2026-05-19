@@ -7,15 +7,67 @@ frontmatter block followed by the prompt body template.
 The framework ships generic persona templates in `triumvirate/templates/
 personas/` that projects copy and customize. The Persona class itself
 doesn't care which version is loaded — it just parses the file.
+
+The triumvirate constitution (``constitution.md``) is loaded once at
+process start and prepended to every persona's rendered prompt. See
+``load_constitution`` and ``Persona.render`` for the wiring; see
+``templates/constitution.md`` for the canonical text.
 """
 from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from string import Template
 
 from ..config import settings
+
+
+# ---- constitution loading -------------------------------------------------
+
+
+_CONSTITUTION_FILENAME = "constitution.md"
+
+
+@lru_cache(maxsize=1)
+def load_constitution() -> str:
+    """Return the constitution text that every persona prompt is prefixed with.
+
+    Discovery order:
+      1. ``<config_root>/constitution.md`` — per-project override.
+      2. ``<config_root>/agents/constitution.md`` — co-located layout.
+      3. The packaged template at ``templates/constitution.md`` —
+         framework default.
+
+    A consumer that wants to opt out of the constitution entirely can
+    place an empty file at one of the first two paths; the persona
+    layer will then prepend an empty preamble. That is an explicit
+    choice (and a constitutional violation per the document itself),
+    not a silent default.
+    """
+    candidates: list[Path] = []
+    try:
+        s = settings()
+        candidates.append(s.config_root / _CONSTITUTION_FILENAME)
+        candidates.append(s.config_root / "agents" / _CONSTITUTION_FILENAME)
+    except FileNotFoundError:
+        # No consumer config present (e.g. running tests against the
+        # framework itself). Fall through to the packaged default.
+        pass
+    # Framework default: relative to this source file → templates/.
+    candidates.append(
+        Path(__file__).resolve().parents[3] / "templates" / _CONSTITUTION_FILENAME
+    )
+    for path in candidates:
+        if path.exists():
+            return path.read_text()
+    return ""  # framework misinstalled; degrade open rather than crash
+
+
+def reset_constitution_cache() -> None:
+    """For tests: clear the lru_cache so a fresh constitution is loaded."""
+    load_constitution.cache_clear()
 
 
 ON_RATE_LIMIT = {"skip_until_reset", "fail"}
@@ -52,7 +104,19 @@ class Persona:
     prompt_template: str = ""
 
     def render(self, **vars: str | int) -> str:
-        return Template(self.prompt_template).safe_substitute(vars)
+        """Render the persona's prompt template with the constitution prepended.
+
+        The constitution is the highest-authority document of the loop
+        (see ``templates/constitution.md``) and is included as a preamble
+        for every persona, every render. Persona prompts may reference
+        constitutional concepts (tiers, the three values, the
+        unanimous-three rule) without re-stating them.
+        """
+        body = Template(self.prompt_template).safe_substitute(vars)
+        constitution = load_constitution()
+        if not constitution:
+            return body
+        return f"{constitution}\n\n---\n\n{body}"
 
     @classmethod
     def load(cls, name: str) -> "Persona":
