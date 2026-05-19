@@ -12,8 +12,16 @@ from typing import Iterable
 import pytest
 
 from agent_loop import config
-from agent_loop.lib import bots, rotation
+from agent_loop.lib import bots, rotation, trust
 from agent_loop.phases import merge_gate
+
+
+@pytest.fixture(autouse=True)
+def _stub_trust(monkeypatch):
+    """Bypass trust filtering in gh.marker_posts — tests synthesize their
+    own posts with the standard ``alexander-matthew`` author and don't
+    need the real trust pipeline."""
+    monkeypatch.setattr(trust, "filter_trusted_marker_posts", lambda posts: posts)
 
 
 @pytest.fixture
@@ -39,12 +47,33 @@ required_clis = ["codex", "gemini"]
 
 
 def _pr(*, files: Iterable[str], labels: Iterable[str] = (),
-        commits: Iterable[dict] | None = None, number: int = 7) -> dict:
+        commits: Iterable[dict] | None = None,
+        reviews: Iterable[dict] | None = None,
+        comments: Iterable[dict] | None = None,
+        number: int = 7) -> dict:
     return {
         "number": number,
         "files": [{"path": p} for p in files],
         "labels": [{"name": n} for n in labels],
         "commits": list(commits or []),
+        "reviews": list(reviews or []),
+        "comments": list(comments or []),
+    }
+
+
+def _review_post(*, cli: str, verdict: str, ts: str, round_n: int = 1) -> dict:
+    """A synthesized reviewer review-comment, anchored to the trailer
+    format that ``_explicit_approves_for_latest_commit`` parses."""
+    body = (
+        f"##VERDICT: {verdict}\n"
+        f"##SUMMARY: synth\n"
+        f"##CHECKLIST:\n- [x] y\n"
+        f"\n---\n*Round {round_n}/3 · reviewer: {cli} · 2026-05-18 22:00*"
+    )
+    return {
+        "submittedAt": ts,
+        "body": body,
+        "author": {"login": "alexander-matthew"},
     }
 
 
@@ -89,29 +118,89 @@ class TestTier3Detection:
 
 
 class TestTier3Approvals:
-    def test_missing_when_no_verdicts(self, settings, monkeypatch):
-        monkeypatch.setattr(rotation, "reviewer_verdicts", lambda n: {})
-        missing = merge_gate._tier3_missing_approvals({"number": 7})
+    """Tests for _tier3_missing_approvals.
+
+    The constitution requires explicit ##VERDICT: APPROVE from each of
+    {claude, codex, gemini}. Critically, an arbiter APPROVE_FOR_MERGE
+    must NOT synthesize approval for the CLI it overrode — that would
+    let the arbiter satisfy unanimous-three single-handedly. The
+    implementation bypasses rotation.reviewer_verdicts (which DOES
+    synthesize) and reads raw posts from PRView. (Reported by gemini
+    on PR #3 R1 review.)
+    """
+
+    def test_missing_when_no_verdicts(self, settings):
+        pr = _pr(files=[], commits=[{"committedDate": "2026-05-18T10:00:00Z"}])
+        missing = merge_gate._tier3_missing_approvals(pr)
         assert set(missing) == {"claude", "codex", "gemini"}
 
-    def test_missing_one_cli(self, settings, monkeypatch):
-        monkeypatch.setattr(rotation, "reviewer_verdicts",
-                            lambda n: {"codex": "APPROVE", "gemini": "APPROVE"})
-        missing = merge_gate._tier3_missing_approvals({"number": 7})
+    def test_missing_one_cli(self, settings):
+        pr = _pr(
+            files=[],
+            commits=[{"committedDate": "2026-05-18T10:00:00Z"}],
+            reviews=[
+                _review_post(cli="codex", verdict="APPROVE", ts="2026-05-18T11:00:00Z"),
+                _review_post(cli="gemini", verdict="APPROVE", ts="2026-05-18T11:30:00Z"),
+            ],
+        )
+        missing = merge_gate._tier3_missing_approvals(pr)
         assert missing == ["claude"]
 
-    def test_request_changes_counts_as_missing(self, settings, monkeypatch):
-        monkeypatch.setattr(rotation, "reviewer_verdicts",
-                            lambda n: {"claude": "APPROVE", "codex": "REQUEST_CHANGES",
-                                       "gemini": "APPROVE"})
-        missing = merge_gate._tier3_missing_approvals({"number": 7})
+    def test_request_changes_counts_as_missing(self, settings):
+        pr = _pr(
+            files=[],
+            commits=[{"committedDate": "2026-05-18T10:00:00Z"}],
+            reviews=[
+                _review_post(cli="claude", verdict="APPROVE", ts="2026-05-18T11:00:00Z"),
+                _review_post(cli="codex", verdict="REQUEST_CHANGES", ts="2026-05-18T11:30:00Z"),
+                _review_post(cli="gemini", verdict="APPROVE", ts="2026-05-18T12:00:00Z"),
+            ],
+        )
+        missing = merge_gate._tier3_missing_approvals(pr)
         assert missing == ["codex"]
 
-    def test_all_three_approve_returns_empty(self, settings, monkeypatch):
-        monkeypatch.setattr(rotation, "reviewer_verdicts",
-                            lambda n: {"claude": "APPROVE", "codex": "APPROVE",
-                                       "gemini": "APPROVE"})
-        assert merge_gate._tier3_missing_approvals({"number": 7}) == []
+    def test_all_three_approve_returns_empty(self, settings):
+        pr = _pr(
+            files=[],
+            commits=[{"committedDate": "2026-05-18T10:00:00Z"}],
+            reviews=[
+                _review_post(cli="claude", verdict="APPROVE", ts="2026-05-18T11:00:00Z"),
+                _review_post(cli="codex", verdict="APPROVE", ts="2026-05-18T11:30:00Z"),
+                _review_post(cli="gemini", verdict="APPROVE", ts="2026-05-18T12:00:00Z"),
+            ],
+        )
+        assert merge_gate._tier3_missing_approvals(pr) == []
+
+    def test_arbiter_override_does_NOT_satisfy_unanimous_three(self, settings):
+        """Critical: an arbiter APPROVE_FOR_MERGE posts a synthetic
+        ##VERDICT: APPROVE wrapper on behalf of the overridden CLI.
+        rotation.reviewer_verdicts would count that. _tier3_missing_approvals
+        must NOT, because the constitution says the arbiter cannot
+        substitute for unanimous-three on tier-3 changes."""
+        arbiter_wrapper_body = (
+            "##VERDICT: APPROVE\n"
+            "##SUMMARY: Arbiter override — see arbiter verdict above.\n"
+            "##CHECKLIST:\n- [x] Arbiter approved for merge\n"
+            "##NOTES:\nThis APPROVE is posted by the arbiter wrapper.\n"
+            "[wrapper:arbiter-override]\n"
+            "\n---\n*Round 1/3 · reviewer: claude · 2026-05-18 22:00*"
+        )
+        pr = _pr(
+            files=[],
+            commits=[{"committedDate": "2026-05-18T10:00:00Z"}],
+            reviews=[
+                _review_post(cli="codex", verdict="APPROVE", ts="2026-05-18T11:00:00Z"),
+                _review_post(cli="gemini", verdict="APPROVE", ts="2026-05-18T11:30:00Z"),
+            ],
+            comments=[{
+                "createdAt": "2026-05-18T12:00:00Z",
+                "body": arbiter_wrapper_body,
+                "author": {"login": "alexander-matthew"},
+            }],
+        )
+        # The synthetic claude APPROVE in the wrapper must NOT count.
+        missing = merge_gate._tier3_missing_approvals(pr)
+        assert "claude" in missing
 
 
 # ---- _is_hard_limit_pr ----------------------------------------------------
@@ -133,12 +222,17 @@ class TestHardLimitDetection:
         ok, _ = merge_gate._is_hard_limit_pr(_pr(files=["templates/config.toml.example"]))
         assert not ok
 
-    def test_protected_path_violation_is_hard_limit(self, settings):
+    def test_protected_path_violations_handled_by_pre_existing_check(self, settings):
+        # Per codex R1: protected-path file edits are *categorically*
+        # refused by the pre-existing protected.violations() check in
+        # _gate_reasons, regardless of authorship. _is_hard_limit_pr
+        # therefore does NOT also flag them — that would duplicate the
+        # reason. This test documents the design.
         ok, reasons = merge_gate._is_hard_limit_pr(
             _pr(files=[".github/workflows/ci.yml"])
         )
-        assert ok
-        assert any("protected path" in r for r in reasons)
+        assert not ok
+        assert reasons == []
 
     def test_unrelated_file_is_not_hard_limit(self, settings):
         ok, _ = merge_gate._is_hard_limit_pr(_pr(files=["README.md"]))
@@ -194,8 +288,10 @@ class TestHumanAuthorship:
 class TestGateReasonsIntegration:
     @pytest.fixture(autouse=True)
     def common_stubs(self, monkeypatch):
-        """Stub out the tier-2 checks so we can isolate the new behaviour."""
-        # Empty status checks → CI 'green' fallback (states <= {SUCCESS,...})
+        """Stub out the tier-2 reviewer check so we can isolate the
+        constitutional behaviour. rotation.reviewer_verdicts is still
+        used by the tier-2 consensus + 'every required reviewer
+        APPROVE'd' branch — not by tier-3 (which reads raw posts)."""
         monkeypatch.setattr(rotation, "reviewer_verdicts",
                             lambda n: {"codex": "APPROVE", "gemini": "APPROVE"})
 
@@ -207,24 +303,52 @@ class TestGateReasonsIntegration:
                 {"author": {"login": "alexander-matthew"},
                  "committedDate": "2026-05-18T00:00:00Z"}
             ],
+            reviews=kwargs.get("reviews") or [],
         )
 
-    def test_tier3_pr_with_only_two_approves_is_blocked(self, settings, monkeypatch):
-        # Override stub: only codex + gemini APPROVE; claude missing.
-        monkeypatch.setattr(rotation, "reviewer_verdicts",
-                            lambda n: {"codex": "APPROVE", "gemini": "APPROVE"})
-        pr = self._base_pr(["templates/constitution.md"])
+    def test_tier3_pr_with_only_two_approves_is_blocked(self, settings):
+        # codex + gemini APPROVE explicitly; claude missing.
+        pr = self._base_pr(
+            ["templates/constitution.md"],
+            reviews=[
+                _review_post(cli="codex", verdict="APPROVE", ts="2026-05-18T11:00:00Z"),
+                _review_post(cli="gemini", verdict="APPROVE", ts="2026-05-18T11:30:00Z"),
+            ],
+        )
         reasons = merge_gate._gate_reasons(pr)
         assert any("tier-3" in r and "missing ['claude']" in r for r in reasons)
 
     def test_tier3_pr_with_all_three_approves_passes_constitutional_check(
-            self, settings, monkeypatch):
-        monkeypatch.setattr(rotation, "reviewer_verdicts",
-                            lambda n: {"claude": "APPROVE", "codex": "APPROVE",
-                                       "gemini": "APPROVE"})
-        pr = self._base_pr(["templates/personas/synthesis.md"])
+            self, settings):
+        pr = self._base_pr(
+            ["templates/personas/synthesis.md"],
+            reviews=[
+                _review_post(cli="claude", verdict="APPROVE", ts="2026-05-18T11:00:00Z"),
+                _review_post(cli="codex", verdict="APPROVE", ts="2026-05-18T11:30:00Z"),
+                _review_post(cli="gemini", verdict="APPROVE", ts="2026-05-18T12:00:00Z"),
+            ],
+        )
         reasons = merge_gate._gate_reasons(pr)
         assert not any("tier-3" in r for r in reasons)
+
+    def test_live_config_edit_is_tier3_hardcoded(self, settings):
+        """codex + gemini both R1-flagged that editing config.toml must
+        be tier-3, since [reviewers].required_clis and
+        [guards].requires_full_consensus_paths live there."""
+        pr = self._base_pr(
+            ["config.toml"],
+            commits=[{"author": {"login": "alexander-matthew"},
+                      "committedDate": "2026-05-18T00:00:00Z"}],
+            reviews=[
+                _review_post(cli="codex", verdict="APPROVE", ts="2026-05-18T11:00:00Z"),
+                _review_post(cli="gemini", verdict="APPROVE", ts="2026-05-18T11:30:00Z"),
+            ],
+        )
+        reasons = merge_gate._gate_reasons(pr)
+        # Both: tier-3 (hardcoded, missing claude) AND hard-limit (human
+        # author satisfied, so no hard-limit reason).
+        assert any("tier-3" in r and "live config" in r and "missing ['claude']" in r
+                   for r in reasons)
 
     def test_hard_limit_pr_with_bot_author_is_blocked(self, settings, monkeypatch):
         monkeypatch.setattr(bots, "configured_bot_logins",

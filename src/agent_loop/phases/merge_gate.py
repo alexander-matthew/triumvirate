@@ -23,10 +23,11 @@ security + librarian + CI green), this gate enforces:
 """
 from __future__ import annotations
 
+import re
 import time
 
 from ..config import settings
-from ..lib import bots, db, gh, kill_switch, protected, review_baton, rotation, transcripts
+from ..lib import bots, db, gh, kill_switch, markers, pr_view, protected, review_baton, rotation, transcripts
 
 
 # Hardcoded tier-3 surface. Cannot be edited by tier-3 consensus alone —
@@ -43,9 +44,17 @@ _TIER3_HARDCODED_PREFIXES: tuple[str, ...] = (
     "templates/personas/",
     "agents/personas/",
 )
-# Settings whose modification is also tier 3 (we detect by looking at
-# config.toml content, but as a coarser fallback we treat any config.toml
-# edit as tier-3-eligible — see _is_tier3_pr).
+# Live config files whose modification is tier-3-eligible because they may
+# (and routinely do) contain settings the constitution defines as tier-3:
+# [reviewers].required_clis and [guards].requires_full_consensus_paths.
+# A future improvement could parse the TOML diff and only flag if those
+# specific keys changed; the current implementation conservatively
+# escalates any live config edit to tier 3, which is the safer default.
+# Reported by codex + gemini on PR #3 R1 review.
+_TIER3_LIVE_CONFIG_FILES: frozenset[str] = frozenset({
+    "config.toml",
+    "agents/config.toml",
+})
 _TIER3_CONFIG_KEYS: tuple[str, ...] = (
     "[reviewers].required_clis",
     "[guards].requires_full_consensus_paths",
@@ -137,7 +146,15 @@ def _is_tier3_pr(pr: dict) -> tuple[bool, list[str]]:
                     reasons.append(f"tier-3 (hardcoded): touches persona prompt {path}")
                     break
 
-    # 2. Config-driven augmentation.
+    # 2. Hardcoded — live config files (may carry tier-3 settings).
+    for path in files:
+        if path in _TIER3_LIVE_CONFIG_FILES:
+            reasons.append(
+                f"tier-3 (hardcoded): touches live config {path}; "
+                f"may modify any of {_TIER3_CONFIG_KEYS}"
+            )
+
+    # 3. Config-driven augmentation.
     for path in files:
         for prefix in s.requires_full_consensus_paths:
             if _matches_path(path, prefix):
@@ -146,7 +163,7 @@ def _is_tier3_pr(pr: dict) -> tuple[bool, list[str]]:
                 )
                 break
 
-    # 3. Label-driven elevation.
+    # 4. Label-driven elevation.
     labels = {l["name"] for l in (pr.get("labels") or [])}
     if _TIER3_LABEL in labels:
         reasons.append(f"tier-3 (label): {_TIER3_LABEL!r} label set")
@@ -154,34 +171,74 @@ def _is_tier3_pr(pr: dict) -> tuple[bool, list[str]]:
     return (bool(reasons), reasons)
 
 
+def _explicit_approves_for_latest_commit(pr: dict) -> set[str]:
+    """Set of CLIs that posted an explicit ##VERDICT: APPROVE on the latest commit.
+
+    Unlike ``rotation.reviewer_verdicts``, this does NOT count synthetic
+    APPROVEs that the arbiter wrapper posts on behalf of an overridden
+    CLI when it issues ``APPROVE_FOR_MERGE``. PRView already filters
+    those synthetic posts out of ``reviewer_posts`` via the
+    ``[wrapper:arbiter-override]`` sentinel + the line-anchored legacy
+    fallback. The constitution requires raw, explicit signal from each
+    of {claude, codex, gemini} for tier-3 merges — using the
+    rotation-level helper would let the arbiter satisfy the unanimous-
+    three rule, which is exactly what the constitution forbids.
+    Reported by gemini on PR #3 R1 review.
+    """
+    commits = pr.get("commits") or []
+    if not commits:
+        return set()
+    latest_ts = (commits[-1].get("committedDate") or "")
+
+    view = pr_view.PRView.from_pr(pr)
+    approved: set[str] = set()
+    # Anchored to the wrapper's own trailer so that a reviewer who
+    # mentions a CLI name in prose can't be misattributed.
+    trailer_re = re.compile(r"\*Round\s+\d+/\d+\s*·\s*reviewer:\s*(\w+)")
+    for post in view.reviewer_posts:
+        if post["ts"] <= latest_ts:
+            continue
+        if markers.extract_inline(post["body"], markers.Section.VERDICT) != "APPROVE":
+            continue
+        m = trailer_re.search(post["body"])
+        if m:
+            approved.add(m.group(1))
+    return approved
+
+
 def _tier3_missing_approvals(pr: dict) -> list[str]:
     """Returns the list of triumvirate CLIs that have NOT posted APPROVE.
 
     For a tier-3 PR to merge, every CLI in :data:`_TRIUMVIRATE` must have
-    an APPROVE verdict on the latest commit. ``rotation.reviewer_verdicts``
-    already filters by latest-commit timestamp; we just check the dict.
+    posted an *explicit* ``##VERDICT: APPROVE`` on the latest commit. See
+    :func:`_explicit_approves_for_latest_commit` for why we bypass the
+    rotation helper here.
     """
-    verdicts = rotation.reviewer_verdicts(pr["number"])
-    return [cli for cli in _TRIUMVIRATE if verdicts.get(cli) != "APPROVE"]
+    approved = _explicit_approves_for_latest_commit(pr)
+    return [cli for cli in _TRIUMVIRATE if cli not in approved]
 
 
 def _is_hard_limit_pr(pr: dict) -> tuple[bool, list[str]]:
-    """True if `pr` modifies any hard-limit surface (config or protected file)."""
+    """True if ``pr`` modifies a hard-limit *config* surface.
+
+    Protected-path file edits are handled separately and unconditionally
+    by the pre-existing ``protected.violations()`` check in
+    :func:`_gate_reasons` — that check adds a refusal reason regardless
+    of authorship, which is the strict reading of "files listed in
+    protected_paths cannot be modified by the loop at all" (codex R1
+    note). So this function focuses on *config* edits that may carry
+    a hard-limit setting change (``protected_paths``,
+    ``trusted_authors``, ``repo``) and require human authorship.
+    """
     reasons: list[str] = []
     files = [f.get("path", "") for f in (pr.get("files") or [])]
 
-    # Live config edits → potential hard-limit setting change.
     for path in files:
         if path in _HARD_LIMIT_CONFIG_FILES:
             reasons.append(
                 f"hard-limit: modifies live config file {path}; possible touch of "
                 f"{_HARD_LIMIT_CONFIG_KEYS}"
             )
-
-    # Protected paths violation = hard-limit by definition.
-    protected_hits = protected.violations(files)
-    for path in protected_hits:
-        reasons.append(f"hard-limit: modifies protected path {path}")
 
     return (bool(reasons), reasons)
 

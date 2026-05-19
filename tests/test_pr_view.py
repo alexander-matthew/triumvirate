@@ -114,20 +114,38 @@ def test_arbiter_override_posts_excluded_from_reviewer_stream():
     assert v.latest_review_verdict == "REQUEST_CHANGES"
 
 
-def test_arbiter_override_detected_case_insensitively_for_legacy_posts():
-    # Historical posts from before the sentinel was introduced relied on
-    # the substring "Arbiter override" in the summary line. The trailer
-    # used lowercase ("arbiter override"). Both must still be recognised
-    # so old PR history doesn't suddenly start double-counting.
-    legacy_lowercase = (
-        "##VERDICT: APPROVE\n##SUMMARY: x\n##CHECKLIST:\n- [x] y\n"
-        "\n---\n*arbiter override · codex*"
+def test_arbiter_override_requires_sentinel():
+    # Sole mechanism is the [wrapper:arbiter-override] sentinel. Posts
+    # without it — even those whose summary mentions "arbiter override"
+    # — are real reviewer posts and must NOT be filtered.
+    summary_mentioning_phrase = (
+        "##VERDICT: APPROVE\n"
+        "##SUMMARY: Arbiter override looked reasonable; agreeing.\n"
+        "##CHECKLIST:\n- [x] y\n"
     )
     v = PRView.from_pr(_pr(
         commits=["2026-05-18T10:00:00Z"],
-        comments=[("2026-05-18T12:00:00Z", legacy_lowercase)],
+        comments=[("2026-05-18T12:00:00Z", summary_mentioning_phrase)],
     ))
-    assert v.reviewer_rounds == 0  # excluded as override
+    assert v.reviewer_rounds == 1  # NOT excluded — no sentinel
+
+
+def test_reviewer_mentioning_arbiter_override_is_not_excluded():
+    # gemini's R1 review of PR #3 flagged that any non-sentinel-based
+    # detection would risk false positives on reviewer prose.
+    real_review_with_mention = (
+        "##VERDICT: REQUEST_CHANGES\n"
+        "##SUMMARY: see notes\n"
+        "##CHECKLIST:\n- [ ] x\n"
+        "##NOTES:\nThe prior arbiter override of this PR was wrong; "
+        "please revisit. [wrapper:arbiter-override-not-this-one]\n"
+    )
+    v = PRView.from_pr(_pr(
+        commits=["2026-05-18T10:00:00Z"],
+        reviews=[("2026-05-18T12:00:00Z", real_review_with_mention)],
+    ))
+    assert v.reviewer_rounds == 1
+    assert v.latest_review_verdict == "REQUEST_CHANGES"
 
 
 # ---- arbiter parsing ------------------------------------------------------

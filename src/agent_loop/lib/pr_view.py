@@ -23,17 +23,15 @@ from .markers import Marker, Section, extract_inline
 # ---- helpers --------------------------------------------------------------
 
 
-# Unambiguous sentinel embedded in arbiter-wrapper APPROVE posts so we
-# never have to rely on prose phrasing (which can drift with persona edits)
-# to identify them. Bracketed form so it cannot appear by accident in
-# normal reviewer text.
+# Unambiguous sentinel embedded in arbiter-wrapper APPROVE posts. A
+# bracketed token that cannot appear by accident in reviewer text or
+# prose. This is the *sole* mechanism for identifying override posts —
+# no legacy substring fallback, because a substring check is necessarily
+# either too narrow (misses casing variations) or too broad (excludes
+# legitimate reviewer notes that happen to mention the phrase). The
+# sentinel is the contract; the wrapper at arbitrate_pr.py always emits
+# it.
 _ARBITER_OVERRIDE_SENTINEL = "[wrapper:arbiter-override]"
-
-# Back-compat: the original implementation used the substring "Arbiter
-# override" (capital A) embedded in the SUMMARY line. Keep matching that
-# (case-insensitively, so the lowercase trailer line that ``arbitrate_pr``
-# also emits is recognised too) so already-merged history still parses.
-_LEGACY_ARBITER_OVERRIDE_NEEDLE = "arbiter override"
 
 
 def _is_arbiter_override(post: dict) -> bool:
@@ -43,10 +41,7 @@ def _is_arbiter_override(post: dict) -> bool:
     ``##VERDICT: APPROVE`` on behalf of the agent it overrode. We filter
     these out of the reviewer-post stream so they don't double-count.
     """
-    body = post.get("body") or ""
-    if _ARBITER_OVERRIDE_SENTINEL in body:
-        return True
-    return _LEGACY_ARBITER_OVERRIDE_NEEDLE in body.lower()
+    return _ARBITER_OVERRIDE_SENTINEL in (post.get("body") or "")
 
 
 # ---- the view -------------------------------------------------------------
