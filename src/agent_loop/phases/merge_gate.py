@@ -1,10 +1,84 @@
-"""Merge gate: pure logic, no agent. Decides whether to auto-merge a PR."""
+"""Merge gate: pure logic, no agent. Decides whether to auto-merge a PR.
+
+Constitutional fidelity (per templates/constitution.md, ratified
+2026-05-18): in addition to the standard tier-2 checks (consensus +
+security + librarian + CI green), this gate enforces:
+
+  - **Tier 3 hardcoded detection.** A PR touching the constitution,
+    any persona prompt, the requires_full_consensus_paths setting, or
+    [reviewers].required_clis is treated as tier 3 regardless of
+    config. Tier-3 PRs require ``##VERDICT: APPROVE`` from each of
+    {claude, codex, gemini} on the latest commit — not just from the
+    configured ``required_clis``. The label
+    ``requires:full-consensus`` and the config knob
+    ``[guards].requires_full_consensus_paths`` are augmentation only;
+    the hardcoded list cannot be bypassed by edits to either.
+
+  - **Hard-limit human authorship.** A PR modifying
+    ``[guards].protected_paths``, ``[project].trusted_authors``,
+    ``[project].repo``, or any file already in ``protected_paths`` is
+    refused unless every commit on the PR is human-authored — i.e. no
+    commit was authored by one of the loop's bot logins
+    (see lib.bots.configured_bot_logins).
+"""
 from __future__ import annotations
 
 import time
 
 from ..config import settings
-from ..lib import db, gh, kill_switch, protected, review_baton, rotation, transcripts
+from ..lib import bots, db, gh, kill_switch, protected, review_baton, rotation, transcripts
+
+
+# Hardcoded tier-3 surface. Cannot be edited by tier-3 consensus alone —
+# this list is the floor of what the constitution treats as
+# constitutional. Operators may *add* more via the config knob
+# [guards].requires_full_consensus_paths, but cannot subtract from this
+# set without also editing this file (which itself touches lib code →
+# tier 2 → does not allow removing hardcoded constitutional surfaces).
+_TIER3_HARDCODED_PATHS: frozenset[str] = frozenset({
+    "templates/constitution.md",
+    "agents/constitution.md",
+})
+_TIER3_HARDCODED_PREFIXES: tuple[str, ...] = (
+    "templates/personas/",
+    "agents/personas/",
+)
+# Settings whose modification is also tier 3 (we detect by looking at
+# config.toml content, but as a coarser fallback we treat any config.toml
+# edit as tier-3-eligible — see _is_tier3_pr).
+_TIER3_CONFIG_KEYS: tuple[str, ...] = (
+    "[reviewers].required_clis",
+    "[guards].requires_full_consensus_paths",
+)
+
+
+# CLI identities that must all APPROVE for tier-3 merges. These three are
+# the triumvirate itself.
+_TRIUMVIRATE = ("claude", "codex", "gemini")
+
+
+# Label that elevates any PR to tier 3 regardless of touched paths.
+_TIER3_LABEL = "requires:full-consensus"
+
+
+# Settings whose modification triggers the hard-limit "human-authored
+# commits only" rule. Paths in protected_paths are checked separately via
+# protected.violations(); these are the *configuration* surfaces.
+_HARD_LIMIT_CONFIG_KEYS: tuple[str, ...] = (
+    "[guards].protected_paths",
+    "[project].trusted_authors",
+    "[project].repo",
+)
+
+
+# Files whose modification is treated as potentially touching a hard-limit
+# config key. We can't reliably parse the TOML diff without reading both
+# revisions, so we conservatively treat any edit to a live config.toml as
+# requiring human authorship. Templates / example files are exempted.
+_HARD_LIMIT_CONFIG_FILES: frozenset[str] = frozenset({
+    "config.toml",
+    "agents/config.toml",
+})
 
 
 def _ci_state(pr: dict) -> str:
@@ -27,6 +101,126 @@ def _ci_state(pr: dict) -> str:
     if states <= {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}:
         return "green"
     return "unknown"
+
+
+# ---- constitutional fidelity ----------------------------------------------
+
+
+def _matches_path(path: str, candidate: str) -> bool:
+    """True if `path` equals `candidate` (file) or sits under `candidate/` (dir)."""
+    if not path or not candidate:
+        return False
+    if path == candidate:
+        return True
+    return path.startswith(candidate.rstrip("/") + "/")
+
+
+def _is_tier3_pr(pr: dict) -> tuple[bool, list[str]]:
+    """True if `pr` touches any tier-3 surface; returns the reasons.
+
+    Detection layers (per the constitution):
+      1. Hardcoded: constitution + every persona file. Cannot be bypassed.
+      2. Config-driven augmentation: [guards].requires_full_consensus_paths.
+      3. Label-driven: `requires:full-consensus` set on the PR.
+    """
+    reasons: list[str] = []
+    files = [f.get("path", "") for f in (pr.get("files") or [])]
+    s = settings()
+
+    # 1. Hardcoded — constitution + personas.
+    for path in files:
+        if path in _TIER3_HARDCODED_PATHS:
+            reasons.append(f"tier-3 (hardcoded): touches {path}")
+        else:
+            for prefix in _TIER3_HARDCODED_PREFIXES:
+                if path.startswith(prefix):
+                    reasons.append(f"tier-3 (hardcoded): touches persona prompt {path}")
+                    break
+
+    # 2. Config-driven augmentation.
+    for path in files:
+        for prefix in s.requires_full_consensus_paths:
+            if _matches_path(path, prefix):
+                reasons.append(
+                    f"tier-3 (config): touches requires_full_consensus_paths entry {prefix!r}"
+                )
+                break
+
+    # 3. Label-driven elevation.
+    labels = {l["name"] for l in (pr.get("labels") or [])}
+    if _TIER3_LABEL in labels:
+        reasons.append(f"tier-3 (label): {_TIER3_LABEL!r} label set")
+
+    return (bool(reasons), reasons)
+
+
+def _tier3_missing_approvals(pr: dict) -> list[str]:
+    """Returns the list of triumvirate CLIs that have NOT posted APPROVE.
+
+    For a tier-3 PR to merge, every CLI in :data:`_TRIUMVIRATE` must have
+    an APPROVE verdict on the latest commit. ``rotation.reviewer_verdicts``
+    already filters by latest-commit timestamp; we just check the dict.
+    """
+    verdicts = rotation.reviewer_verdicts(pr["number"])
+    return [cli for cli in _TRIUMVIRATE if verdicts.get(cli) != "APPROVE"]
+
+
+def _is_hard_limit_pr(pr: dict) -> tuple[bool, list[str]]:
+    """True if `pr` modifies any hard-limit surface (config or protected file)."""
+    reasons: list[str] = []
+    files = [f.get("path", "") for f in (pr.get("files") or [])]
+
+    # Live config edits → potential hard-limit setting change.
+    for path in files:
+        if path in _HARD_LIMIT_CONFIG_FILES:
+            reasons.append(
+                f"hard-limit: modifies live config file {path}; possible touch of "
+                f"{_HARD_LIMIT_CONFIG_KEYS}"
+            )
+
+    # Protected paths violation = hard-limit by definition.
+    protected_hits = protected.violations(files)
+    for path in protected_hits:
+        reasons.append(f"hard-limit: modifies protected path {path}")
+
+    return (bool(reasons), reasons)
+
+
+def _commit_authors(pr: dict) -> list[str]:
+    """Return each commit's author login on this PR (best-effort)."""
+    out: list[str] = []
+    for commit in (pr.get("commits") or []):
+        author = (commit.get("author") or {})
+        login = author.get("login") or ""
+        if login:
+            out.append(login)
+    return out
+
+
+def _all_commits_human_authored(pr: dict) -> tuple[bool, str | None]:
+    """True if no commit on this PR was authored by one of the loop's bot logins.
+
+    Returns (ok, offending_login) — if any commit is bot-authored, ok is
+    False and offending_login is the first bot login encountered.
+    """
+    bot_logins = bots.configured_bot_logins()
+    if not bot_logins:
+        # No bots configured on this host → we can't distinguish bot from
+        # human commits, so we cannot prove human authorship. Be strict:
+        # refuse, with a reason that tells the operator to configure bots
+        # or merge the hard-limit PR manually outside the loop.
+        return (False, None)
+    authors = _commit_authors(pr)
+    if not authors:
+        # No commit author metadata available → cannot prove → refuse.
+        return (False, None)
+    for login in authors:
+        if login in bot_logins:
+            return (False, login)
+    return (True, None)
+
+
+# ---- the gate -------------------------------------------------------------
 
 
 def _gate_reasons(pr: dict) -> list[str]:
@@ -81,6 +275,35 @@ def _gate_reasons(pr: dict) -> list[str]:
     mergeable = (pr.get("mergeable") or "").upper()
     if mergeable == "CONFLICTING":
         reasons.append("PR has merge conflicts")
+
+    # ---- constitutional fidelity ----------------------------------------
+    # Tier-3: require APPROVE from each of {claude, codex, gemini}.
+    is_tier3, tier3_reasons = _is_tier3_pr(pr)
+    if is_tier3:
+        missing = _tier3_missing_approvals(pr)
+        if missing:
+            reasons.append(
+                f"{tier3_reasons[0]}; tier-3 requires APPROVE from each of "
+                f"{list(_TRIUMVIRATE)} — missing {missing}"
+            )
+
+    # Hard-limit: PRs touching protected_paths setting / trusted_authors /
+    # repo / files in protected_paths must be human-authored end-to-end.
+    is_hard_limit, hl_reasons = _is_hard_limit_pr(pr)
+    if is_hard_limit:
+        ok, offender = _all_commits_human_authored(pr)
+        if not ok:
+            if offender:
+                reasons.append(
+                    f"{hl_reasons[0]}; hard-limit requires human-authored commits, "
+                    f"but commit author {offender!r} is a configured bot"
+                )
+            else:
+                reasons.append(
+                    f"{hl_reasons[0]}; hard-limit requires human-authored commits, "
+                    f"but commit author identity could not be verified "
+                    f"(no bots configured, or no commit author metadata)"
+                )
 
     return reasons
 
