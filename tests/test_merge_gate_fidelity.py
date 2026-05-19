@@ -171,6 +171,48 @@ class TestTier3Approvals:
         )
         assert merge_gate._tier3_missing_approvals(pr) == []
 
+    def test_later_request_changes_retracts_earlier_approve(self, settings):
+        """codex R2 bug: walking posts oldest-to-newest and only adding
+        on APPROVE leaves stale APPROVEs in place if the same CLI later
+        REQUEST_CHANGES on the same commit. We must take each CLI's
+        *latest* verdict, not the first APPROVE we see."""
+        pr = _pr(
+            files=[],
+            commits=[{"committedDate": "2026-05-18T10:00:00Z"}],
+            reviews=[
+                _review_post(cli="claude", verdict="APPROVE", ts="2026-05-18T11:00:00Z"),
+                _review_post(cli="codex", verdict="APPROVE", ts="2026-05-18T11:30:00Z"),
+                _review_post(cli="gemini", verdict="APPROVE", ts="2026-05-18T11:45:00Z"),
+                # codex spots a problem on review re-pass and retracts:
+                _review_post(cli="codex", verdict="REQUEST_CHANGES", ts="2026-05-18T12:00:00Z",
+                             round_n=2),
+            ],
+        )
+        missing = merge_gate._tier3_missing_approvals(pr)
+        assert "codex" in missing
+        assert "claude" not in missing
+        assert "gemini" not in missing
+
+    def test_malformed_trailer_does_not_count_as_approve(self, settings):
+        """codex R2: a post with no parseable reviewer-attribution
+        trailer cannot be attributed to a specific CLI, so it cannot
+        satisfy any of {claude, codex, gemini}."""
+        body_no_trailer = (
+            "##VERDICT: APPROVE\n##SUMMARY: lgtm\n##CHECKLIST:\n- [x] y\n"
+            # No "*Round N/M · reviewer: X*" trailer.
+        )
+        pr = _pr(
+            files=[],
+            commits=[{"committedDate": "2026-05-18T10:00:00Z"}],
+            reviews=[{
+                "submittedAt": "2026-05-18T11:00:00Z",
+                "body": body_no_trailer,
+                "author": {"login": "alexander-matthew"},
+            }],
+        )
+        missing = merge_gate._tier3_missing_approvals(pr)
+        assert set(missing) == {"claude", "codex", "gemini"}
+
     def test_arbiter_override_does_NOT_satisfy_unanimous_three(self, settings):
         """Critical: an arbiter APPROVE_FOR_MERGE posts a synthetic
         ##VERDICT: APPROVE wrapper on behalf of the overridden CLI.

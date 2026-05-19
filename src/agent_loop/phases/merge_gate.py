@@ -171,51 +171,67 @@ def _is_tier3_pr(pr: dict) -> tuple[bool, list[str]]:
     return (bool(reasons), reasons)
 
 
-def _explicit_approves_for_latest_commit(pr: dict) -> set[str]:
-    """Set of CLIs that posted an explicit ##VERDICT: APPROVE on the latest commit.
+def _latest_verdict_per_cli(pr: dict) -> dict[str, str]:
+    """Each triumvirate CLI's *latest* explicit verdict on the latest commit.
 
-    Unlike ``rotation.reviewer_verdicts``, this does NOT count synthetic
-    APPROVEs that the arbiter wrapper posts on behalf of an overridden
-    CLI when it issues ``APPROVE_FOR_MERGE``. PRView already filters
-    those synthetic posts out of ``reviewer_posts`` via the
-    ``[wrapper:arbiter-override]`` sentinel + the line-anchored legacy
-    fallback. The constitution requires raw, explicit signal from each
-    of {claude, codex, gemini} for tier-3 merges — using the
-    rotation-level helper would let the arbiter satisfy the unanimous-
-    three rule, which is exactly what the constitution forbids.
-    Reported by gemini on PR #3 R1 review.
+    Maps cli → verdict ("APPROVE" / "REQUEST_CHANGES" / "COMMENT"). CLIs
+    that have not posted any verdict on the latest commit are absent
+    from the dict.
+
+    Critical correctness properties (both reported by reviewers):
+
+    1. **No arbiter synthesis** (gemini R1). The arbiter wrapper posts a
+       synthetic ``##VERDICT: APPROVE`` on behalf of the CLI it overrode
+       when it issues ``APPROVE_FOR_MERGE``. Those posts carry the
+       ``[wrapper:arbiter-override]`` sentinel and are filtered out by
+       :class:`PRView`. Using rotation.reviewer_verdicts here would
+       count them and let the arbiter single-handedly satisfy the
+       unanimous-three rule the constitution forbids.
+
+    2. **Latest verdict per CLI wins** (codex R2). A CLI may APPROVE,
+       then push REQUEST_CHANGES on the same commit (e.g., after
+       spotting an issue in follow-up review). Walking oldest-to-newest
+       and only adding-on-APPROVE would leave the stale APPROVE in
+       place. We walk newest-to-oldest and take the first-seen verdict
+       per CLI, which is each CLI's most recent posted opinion.
     """
     commits = pr.get("commits") or []
     if not commits:
-        return set()
+        return {}
     latest_ts = (commits[-1].get("committedDate") or "")
 
     view = pr_view.PRView.from_pr(pr)
-    approved: set[str] = set()
     # Anchored to the wrapper's own trailer so that a reviewer who
     # mentions a CLI name in prose can't be misattributed.
     trailer_re = re.compile(r"\*Round\s+\d+/\d+\s*·\s*reviewer:\s*(\w+)")
-    for post in view.reviewer_posts:
+    latest: dict[str, str] = {}
+    for post in reversed(view.reviewer_posts):
         if post["ts"] <= latest_ts:
-            continue
-        if markers.extract_inline(post["body"], markers.Section.VERDICT) != "APPROVE":
-            continue
+            break  # posts are oldest-first; once we cross the commit boundary, stop
         m = trailer_re.search(post["body"])
-        if m:
-            approved.add(m.group(1))
-    return approved
+        if not m:
+            continue  # malformed trailer → cannot attribute to a CLI
+        cli = m.group(1)
+        if cli in latest:
+            continue  # we already saw a newer post from this CLI
+        verdict = markers.extract_inline(post["body"], markers.Section.VERDICT)
+        if verdict is None:
+            continue
+        latest[cli] = verdict
+    return latest
 
 
 def _tier3_missing_approvals(pr: dict) -> list[str]:
     """Returns the list of triumvirate CLIs that have NOT posted APPROVE.
 
-    For a tier-3 PR to merge, every CLI in :data:`_TRIUMVIRATE` must have
-    posted an *explicit* ``##VERDICT: APPROVE`` on the latest commit. See
-    :func:`_explicit_approves_for_latest_commit` for why we bypass the
-    rotation helper here.
+    For a tier-3 PR to merge, every CLI in :data:`_TRIUMVIRATE` must
+    have posted an explicit ``##VERDICT: APPROVE`` on the latest commit
+    *and* that APPROVE must still stand — a subsequent REQUEST_CHANGES
+    by the same CLI on the same commit retracts the approval. See
+    :func:`_latest_verdict_per_cli` for the parsing semantics.
     """
-    approved = _explicit_approves_for_latest_commit(pr)
-    return [cli for cli in _TRIUMVIRATE if cli not in approved]
+    latest = _latest_verdict_per_cli(pr)
+    return [cli for cli in _TRIUMVIRATE if latest.get(cli) != "APPROVE"]
 
 
 def _is_hard_limit_pr(pr: dict) -> tuple[bool, list[str]]:
