@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 from .config import settings
-from .lib import db, gh, kill_switch, quota
+from .lib import bots, db, gh, kill_switch, quota
 from .lib.paths import ensure_state_dir
 
 
@@ -203,6 +203,140 @@ def cmd_list(_args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- bots ------------------------------------------------------------------
+
+
+_KNOWN_CLIS = ("claude", "codex", "gemini")
+
+
+def cmd_bots_list(_args: argparse.Namespace) -> int:
+    configured = bots.list_configured()
+    _section("GitHub App bots")
+    if not configured:
+        print(_dim("  (none configured — run `agent-loop bots add <cli>`)"))
+        return 0
+    for cli in _KNOWN_CLIS:
+        meta = bots.load_meta(cli)
+        if not meta:
+            print(f"  {cli:7s}  {_dim('(not configured)')}")
+            continue
+        login = meta.get("bot_login", "?")
+        app_id = meta.get("app_id", "?")
+        print(f"  {cli:7s}  {_ok(login)}  app_id={app_id}  user_id={meta.get('bot_user_id','?')}")
+    return 0
+
+
+def cmd_bots_add(args: argparse.Namespace) -> int:
+    cli = args.cli
+    if cli not in _KNOWN_CLIS:
+        print(_err(f"unknown cli {cli!r}; expected one of {_KNOWN_CLIS}"))
+        return 2
+
+    app_id = args.app_id
+    if app_id is None:
+        try:
+            app_id = int(input(f"App ID for {cli}-bot: ").strip())
+        except (ValueError, EOFError):
+            print(_err("invalid app id"))
+            return 2
+
+    pem_path = args.pem_file
+    if pem_path is None:
+        pem_path = input(f"Path to {cli}-bot .pem private key: ").strip()
+    pem_p = os.path.expanduser(pem_path)
+    if not os.path.isfile(pem_p):
+        print(_err(f"no such file: {pem_p}"))
+        return 2
+    pem_text = open(pem_p).read()
+
+    try:
+        meta = bots.setup(cli, app_id=int(app_id), pem_text=pem_text)
+    except bots.BotError as e:
+        print(_err(f"setup failed: {e}"))
+        return 1
+    print(_ok(f"saved {cli} bot: {meta['bot_login']} (app_id={meta['app_id']})"))
+    return 0
+
+
+def cmd_bots_provision(args: argparse.Namespace) -> int:
+    cli = args.cli
+    if cli not in _KNOWN_CLIS:
+        print(_err(f"unknown cli {cli!r}"))
+        return 2
+
+    gh_user = bots._gh_user_login()
+    app_name = args.name or f"{cli}-bot-{gh_user}"
+    redirect_host = args.host
+
+    _section(f"Provisioning {cli}-bot via App Manifest flow")
+    print(f"  app name : {app_name}")
+    print(f"  redirect : http://{redirect_host}:{args.port}/callback")
+    print()
+    try:
+        meta = bots.run_manifest_flow(
+            cli, app_name=app_name, redirect_host=redirect_host, port=args.port,
+        )
+    except bots.BotError as e:
+        print(_err(f"provisioning failed: {e}"))
+        return 1
+
+    print()
+    print(_ok(f"created {meta['bot_login']} (app_id={meta['app_id']})"))
+    print()
+    print("Next: install the app on your target repo. Open:")
+    print(f"  {meta.get('install_url') or meta.get('app_html_url')}")
+    print("Choose 'Only select repositories' and pick the repo(s) the loop should act on.")
+    return 0
+
+
+def cmd_bots_test(args: argparse.Namespace) -> int:
+    cli = args.cli
+    if cli not in _KNOWN_CLIS:
+        print(_err(f"unknown cli {cli!r}"))
+        return 2
+    if not bots.is_configured(cli):
+        print(_err(f"{cli} bot not configured. Run `agent-loop bots add {cli}`."))
+        return 1
+
+    repo = args.repo or settings().repo
+    if not repo:
+        print(_err("no repo — pass --repo OR run from a project with [project].repo set"))
+        return 2
+
+    _section(f"{cli} bot")
+    meta = bots.load_meta(cli) or {}
+    print(f"  login    : {meta.get('bot_login')}")
+    print(f"  app_id   : {meta.get('app_id')}")
+    print(f"  email    : {bots.bot_email(cli)}")
+    print(f"  repo     : {repo}")
+    try:
+        tok = bots.mint_installation_token(cli, repo=repo)
+    except bots.BotError as e:
+        print(_err(f"  token    : FAILED — {e}"))
+        return 1
+    print(_ok(f"  token    : minted (...{tok[-8:]}, ~1h TTL)"))
+
+    # Probe the token against the API to confirm scope.
+    import urllib.request, json as _json
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}",
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "agent-loop-bots/1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read())
+        perms = data.get("permissions", {})
+        print(_ok(f"  api      : OK — perms={perms}"))
+    except Exception as e:
+        print(_err(f"  api      : FAILED — {e}"))
+        return 1
+    return 0
+
+
 # ---- entry -----------------------------------------------------------------
 
 
@@ -222,6 +356,28 @@ def main() -> int:
     sub.add_parser("halt", help="engage all kill switches").set_defaults(fn=cmd_halt)
     sub.add_parser("resume", help="reverse halt").set_defaults(fn=cmd_resume)
     sub.add_parser("list", help="list open loop-labeled issues + PRs").set_defaults(fn=cmd_list)
+
+    b = sub.add_parser("bots", help="manage GitHub App bot identities (claude/codex/gemini)")
+    bsub = b.add_subparsers(dest="bots_cmd", required=True)
+    bsub.add_parser("list", help="show configured bots").set_defaults(fn=cmd_bots_list)
+    ba = bsub.add_parser("add", help="register a bot's app id + private key")
+    ba.add_argument("cli", choices=_KNOWN_CLIS)
+    ba.add_argument("--app-id", type=int)
+    ba.add_argument("--pem-file")
+    ba.set_defaults(fn=cmd_bots_add)
+    bp = bsub.add_parser("provision",
+                         help="create a GitHub App via the Manifest flow (one click on github.com)")
+    bp.add_argument("cli", choices=_KNOWN_CLIS)
+    bp.add_argument("--host", default="homelab.tail7815d8.ts.net",
+                    help="hostname the user's browser will reach this server at (default: %(default)s)")
+    bp.add_argument("--port", type=int, default=8765,
+                    help="port to bind locally for the callback (default: %(default)s)")
+    bp.add_argument("--name", help="GitHub App name (default: <cli>-bot-<gh-username>)")
+    bp.set_defaults(fn=cmd_bots_provision)
+    bt = bsub.add_parser("test", help="mint a token + probe the API")
+    bt.add_argument("cli", choices=_KNOWN_CLIS)
+    bt.add_argument("--repo", help="owner/name (default: from config.toml)")
+    bt.set_defaults(fn=cmd_bots_test)
 
     args = p.parse_args()
     return args.fn(args)

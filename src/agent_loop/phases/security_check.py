@@ -83,7 +83,7 @@ def check(pr_number: int) -> int:
 
     sensitive, paths = _is_sensitive_pr(pr)
     if not sensitive:
-        gh.add_label(kind="pr", number=pr_number, label=s.label("security_cleared"))
+        gh.add_label(kind="pr", number=pr_number, label=s.label("security_cleared"), as_cli=persona.cli)
         db.append(phase="security", action="finish", pr_number=pr_number,
                   outcome="not_sensitive",
                   notes={"label_applied": s.label("security_cleared")})
@@ -96,7 +96,7 @@ def check(pr_number: int) -> int:
     branch = pr.get("headRefName", "")
     worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"security-{pr_number}", base="origin/main")
+        worktree = git_worktree.create(f"security-{pr_number}", base="origin/main", as_cli=persona.cli)
         subprocess.run(["git", "fetch", "origin", f"{branch}:{branch}", "--force"],
                        cwd=worktree, check=True, capture_output=True)
         subprocess.run(["git", "checkout", branch],
@@ -144,13 +144,13 @@ def check(pr_number: int) -> int:
             f"\n---\n*security: {persona.cli} · "
             f"{time.strftime('%Y-%m-%d %H:%M')}*"
         )
-        gh.comment(kind="pr", number=pr_number, body=body)
+        gh.comment(kind="pr", number=pr_number, body=body, as_cli=persona.cli)
 
         if parsed["verdict"] == "FLAG":
-            gh.add_label(kind="pr", number=pr_number, label=s.label("security_flag"))
-            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"))
+            gh.add_label(kind="pr", number=pr_number, label=s.label("security_flag"), as_cli=persona.cli)
+            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"), as_cli=persona.cli)
         else:
-            gh.add_label(kind="pr", number=pr_number, label=s.label("security_cleared"))
+            gh.add_label(kind="pr", number=pr_number, label=s.label("security_cleared"), as_cli=persona.cli)
 
         db.append(phase="security", action="finish", agent=persona.cli,
                   pr_number=pr_number, duration_s=duration,

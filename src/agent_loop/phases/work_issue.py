@@ -56,10 +56,10 @@ def run() -> int:
     db.append(phase="work", action="start", agent=persona.cli, issue_number=n,
               notes={"branch": branch, "title": title, "persona": persona.name})
 
-    gh.add_label(kind="issue", number=n, label=s.label("in_progress"))
+    gh.add_label(kind="issue", number=n, label=s.label("in_progress"), as_cli=persona.cli)
     worktree: Path | None = None
     try:
-        worktree = git_worktree.create(branch, base="origin/main")
+        worktree = git_worktree.create(branch, base="origin/main", as_cli=persona.cli)
         task_context = (
             f"## Task — implement issue #{n}\n\n"
             f"You are starting fresh on a new branch based on `origin/main`. "
@@ -77,7 +77,7 @@ def run() -> int:
             db.append(phase="work", action="error", agent=persona.cli,
                       issue_number=n, duration_s=duration, outcome="rate_limited",
                       notes={"retry_after_ts": run_.retry_after_ts})
-            gh.remove_label(kind="issue", number=n, label=s.label("in_progress"))
+            gh.remove_label(kind="issue", number=n, label=s.label("in_progress"), as_cli=persona.cli)
             return 1
 
         if run_.timed_out or run_.returncode != 0:
@@ -86,14 +86,14 @@ def run() -> int:
                       duration_s=duration,
                       outcome="timed_out" if run_.timed_out else "nonzero_exit",
                       notes={"stderr": run_.stderr[-2000:]})
-            gh.remove_label(kind="issue", number=n, label=s.label("in_progress"))
+            gh.remove_label(kind="issue", number=n, label=s.label("in_progress"), as_cli=persona.cli)
             return 2
 
         if not git_worktree.has_commits_since_base(worktree):
             db.append(phase="work", action="error", agent=persona.cli,
                       issue_number=n, duration_s=duration, outcome="no_commits",
                       notes={"stdout_tail": run_.stdout[-500:]})
-            gh.remove_label(kind="issue", number=n, label=s.label("in_progress"))
+            gh.remove_label(kind="issue", number=n, label=s.label("in_progress"), as_cli=persona.cli)
             return 2
 
         adds, dels = git_worktree.diff_stats(worktree)
@@ -101,7 +101,7 @@ def run() -> int:
         changed = git_worktree.changed_paths(worktree)
         bad_paths = protected.violations(changed)
 
-        git_worktree.push(worktree, branch)
+        git_worktree.push(worktree, branch, as_cli=persona.cli)
 
         body_lines = [
             f"Closes #{n}",
@@ -126,6 +126,7 @@ def run() -> int:
 
         pr_number = gh.create_pr(
             head=branch, base="main", title=title, body=body, labels=labels,
+            as_cli=persona.cli,
         )
 
         outcome = "opened"
@@ -144,12 +145,12 @@ def run() -> int:
     except kill_switch.HaltRequested as e:
         db.append(phase="work", action="halted", agent=persona.cli,
                   issue_number=n, notes={"reason": str(e)})
-        gh.remove_label(kind="issue", number=n, label=s.label("in_progress"))
+        gh.remove_label(kind="issue", number=n, label=s.label("in_progress"), as_cli=persona.cli)
         return 2
     except Exception as e:
         db.append(phase="work", action="error", agent=persona.cli,
                   issue_number=n, notes={"error": repr(e)})
-        gh.remove_label(kind="issue", number=n, label=s.label("in_progress"))
+        gh.remove_label(kind="issue", number=n, label=s.label("in_progress"), as_cli=persona.cli)
         return 2
     finally:
         if worktree is not None:

@@ -16,7 +16,9 @@ classifiers = [
 
 # Runtime deps deliberately minimal. The agents talk via subprocess (gh, claude,
 # codex, gemini CLIs). No SDK clients here — that's the whole point.
-dependencies = []
+dependencies = [
+    "pyjwt[crypto]>=2.12.1",
+]
 
 [project.optional-dependencies]
 dev = [

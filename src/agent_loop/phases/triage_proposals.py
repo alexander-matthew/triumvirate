@@ -64,7 +64,7 @@ def run() -> int:
     started = time.time()
     worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"triage-{int(started)}", base="origin/main")
+        worktree = git_worktree.create(f"triage-{int(started)}", base="origin/main", as_cli=persona.cli)
         prompt = persona.render(ISSUE_LIST=issue_list)
         run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
         duration = run_.duration_s
@@ -101,15 +101,15 @@ def run() -> int:
                 continue
             try:
                 if decision == "approve":
-                    gh.remove_label(kind="issue", number=n, label=s.label("proposal"))
-                    gh.add_label(kind="issue", number=n, label=s.label("approved"))
-                    gh.comment(kind="issue", number=n,
+                    gh.remove_label(kind="issue", number=n, label=s.label("proposal"), as_cli=persona.cli)
+                    gh.add_label(kind="issue", number=n, label=s.label("approved"), as_cli=persona.cli)
+                    gh.comment(kind="issue", number=n, as_cli=persona.cli,
                                body=f"🤖 Auto-approved by triage agent. Reason: {reason}")
                 elif decision == "reject":
-                    gh.comment(kind="issue", number=n,
+                    gh.comment(kind="issue", number=n, as_cli=persona.cli,
                                body=f"🤖 Rejected by triage agent. Reason: {reason}")
                     from ..lib.gh import _run  # type: ignore
-                    _run(["issue", "close", str(n)])
+                    _run(["issue", "close", str(n)], as_cli=persona.cli)
                 applied.append({"issue": n, "decision": decision, "reason": reason})
             except Exception as e:
                 applied.append({"issue": n, "decision": "error",

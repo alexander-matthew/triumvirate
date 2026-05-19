@@ -91,7 +91,7 @@ def respond(pr_number: int) -> int:
 
     round_n = _round_number_from_body(latest_review.get("body", ""))
     if round_n >= s.max_review_rounds:
-        gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"))
+        gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"), as_cli=persona.cli)
         db.append(phase="respond", action="finish", pr_number=pr_number,
                   outcome="escalated_max_rounds", notes={"round": round_n})
         return 1
@@ -102,7 +102,7 @@ def respond(pr_number: int) -> int:
     branch = pr.get("headRefName", "")
     worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"respond-{pr_number}-r{round_n}", base="origin/main")
+        worktree = git_worktree.create(f"respond-{pr_number}-r{round_n}", base="origin/main", as_cli=persona.cli)
         subprocess.run(["git", "fetch", "origin", f"{branch}:{branch}", "--force"],
                        cwd=worktree, check=True, capture_output=True)
         subprocess.run(["git", "checkout", branch],
@@ -145,8 +145,7 @@ def respond(pr_number: int) -> int:
         changed = git_worktree.changed_paths(worktree)
         bad_paths = protected.violations(changed)
 
-        subprocess.run(["git", "push", "origin", branch],
-                       cwd=worktree, check=True, capture_output=True)
+        git_worktree.push(worktree, branch, as_cli=persona.cli)
 
         comment_lines = [
             f"Responded to round-{round_n} review.",
@@ -155,12 +154,12 @@ def respond(pr_number: int) -> int:
         if bad_paths:
             comment_lines += ["", "⚠️ Touched protected paths:",
                               *[f"- `{p}`" for p in bad_paths]]
-            gh.add_label(kind="pr", number=pr_number, label=s.label("protected_violation"))
-            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"))
+            gh.add_label(kind="pr", number=pr_number, label=s.label("protected_violation"), as_cli=persona.cli)
+            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"), as_cli=persona.cli)
         if too_large:
             comment_lines += ["", f"⚠️ Diff now exceeds {s.max_diff_loc} LOC."]
-            gh.add_label(kind="pr", number=pr_number, label=s.label("too_large"))
-        gh.comment(kind="pr", number=pr_number, body="\n".join(comment_lines))
+            gh.add_label(kind="pr", number=pr_number, label=s.label("too_large"), as_cli=persona.cli)
+        gh.comment(kind="pr", number=pr_number, body="\n".join(comment_lines), as_cli=persona.cli)
 
         db.append(phase="respond", action="finish", agent=persona.cli,
                   pr_number=pr_number, duration_s=duration,

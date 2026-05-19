@@ -77,7 +77,7 @@ def check(pr_number: int) -> int:
 
     paths = _trigger_paths_touched(pr)
     if not paths:
-        gh.add_label(kind="pr", number=pr_number, label=s.label("librarian_cleared"))
+        gh.add_label(kind="pr", number=pr_number, label=s.label("librarian_cleared"), as_cli=persona.cli)
         db.append(phase="librarian", action="finish", pr_number=pr_number,
                   outcome="not_cross_project")
         return 0
@@ -89,7 +89,7 @@ def check(pr_number: int) -> int:
     branch = pr.get("headRefName", "")
     worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"librarian-{pr_number}", base="origin/main")
+        worktree = git_worktree.create(f"librarian-{pr_number}", base="origin/main", as_cli=persona.cli)
         subprocess.run(["git", "fetch", "origin", f"{branch}:{branch}", "--force"],
                        cwd=worktree, check=True, capture_output=True)
         subprocess.run(["git", "checkout", branch],
@@ -136,13 +136,13 @@ def check(pr_number: int) -> int:
             f"\n---\n*librarian: {persona.cli} · "
             f"{time.strftime('%Y-%m-%d %H:%M')}*"
         )
-        gh.comment(kind="pr", number=pr_number, body=body)
+        gh.comment(kind="pr", number=pr_number, body=body, as_cli=persona.cli)
 
         if parsed["verdict"] == "AUDIT_FAIL":
-            gh.add_label(kind="pr", number=pr_number, label=s.label("librarian_flag"))
-            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"))
+            gh.add_label(kind="pr", number=pr_number, label=s.label("librarian_flag"), as_cli=persona.cli)
+            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"), as_cli=persona.cli)
         else:
-            gh.add_label(kind="pr", number=pr_number, label=s.label("librarian_cleared"))
+            gh.add_label(kind="pr", number=pr_number, label=s.label("librarian_cleared"), as_cli=persona.cli)
 
         db.append(phase="librarian", action="finish", agent=persona.cli,
                   pr_number=pr_number, duration_s=duration,

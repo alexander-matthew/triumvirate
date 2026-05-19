@@ -11,12 +11,30 @@ The list of trusted authors comes from `Settings.trusted_authors`
 from __future__ import annotations
 
 from ..config import settings
+from . import bots
 
 
 def author_trusted(login: str | None) -> bool:
+    """True if `login` is in the project's trusted_authors OR is one of
+    this host's configured GitHub App bots.
+
+    Bot logins are auto-trusted so the operator doesn't have to re-list
+    them in every project's `trusted_authors`. They're already proven by
+    having a private key in `~/.config/agent-loop/bots/`.
+
+    GitHub's GraphQL API (what `gh --json` uses) returns bot logins WITHOUT
+    the trailing `[bot]` (`codex-bot-foo`), while REST/UI shows them WITH
+    (`codex-bot-foo[bot]`). We accept both forms.
+    """
     if not login:
         return False
-    return login.lower() in settings().trusted_authors
+    if login.lower() in settings().trusted_authors:
+        return True
+    bot_logins = bots.configured_bot_logins()
+    if login in bot_logins:
+        return True
+    stripped = {b[:-len("[bot]")] if b.endswith("[bot]") else b for b in bot_logins}
+    return login in stripped
 
 
 def filter_trusted_marker_posts(posts: list[dict]) -> list[dict]:

@@ -227,7 +227,7 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
     branch = pr.get("headRefName", "")
     worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"review-{pr_number}-r{round_n}", base="origin/main")
+        worktree = git_worktree.create(f"review-{pr_number}-r{round_n}", base="origin/main", as_cli=persona.cli)
         subprocess.run(["git", "fetch", "origin", f"{branch}:{branch}", "--force"],
                        cwd=worktree, check=True, capture_output=True)
         subprocess.run(["git", "checkout", branch],
@@ -285,7 +285,7 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
         if not parsed:
             if persona.on_parse_fail == "comment_and_retry":
                 gh.comment(
-                    kind="pr", number=pr_number,
+                    kind="pr", number=pr_number, as_cli=persona.cli,
                     body=("⚠️ Reviewer agent produced unparseable output. Raw last message:\n\n"
                           f"```\n{run_.final_message[:3000]}\n```"),
                 )
@@ -306,10 +306,10 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
             if bad_paths:
                 extra.append("**Protected-path violations** (wrapper-enforced):\n"
                              + "\n".join(f"- `{p}`" for p in bad_paths))
-                gh.add_label(kind="pr", number=pr_number, label=s.label("protected_violation"))
+                gh.add_label(kind="pr", number=pr_number, label=s.label("protected_violation"), as_cli=persona.cli)
             if too_large:
                 extra.append(f"**Diff exceeds {s.max_diff_loc} LOC** (+{adds}/-{dels}, wrapper-enforced).")
-                gh.add_label(kind="pr", number=pr_number, label=s.label("too_large"))
+                gh.add_label(kind="pr", number=pr_number, label=s.label("too_large"), as_cli=persona.cli)
             parsed["checklist"] = "\n".join(extra) + "\n\n" + parsed["checklist"]
 
         review_body = (
@@ -327,7 +327,22 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
         }
         gh.review(pr_number=pr_number,
                   verdict=verdict_to_flag[enforced_verdict],
-                  body=review_body)
+                  body=review_body,
+                  as_cli=persona.cli)
+
+        review_baton.append_review(
+            pr_number=pr_number,
+            head_sha=current_head,
+            reviewer=persona.cli,
+            round_n=round_n,
+            verdict=enforced_verdict,
+            summary=parsed["summary"],
+            checklist=parsed["checklist"],
+            notes=parsed["notes"],
+            additions=adds,
+            deletions=dels,
+            changed_files=pr.get("changedFiles", 0),
+        )
 
         review_baton.append_review(
             pr_number=pr_number,

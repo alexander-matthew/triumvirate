@@ -91,7 +91,7 @@ def arbitrate(pr_number: int) -> int:
     branch = pr.get("headRefName", "")
     worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"arbitrate-{pr_number}", base="origin/main")
+        worktree = git_worktree.create(f"arbitrate-{pr_number}", base="origin/main", as_cli=persona.cli)
         subprocess.run(["git", "fetch", "origin", f"{branch}:{branch}", "--force"],
                        cwd=worktree, check=True, capture_output=True)
         subprocess.run(["git", "checkout", branch],
@@ -138,13 +138,13 @@ def arbitrate(pr_number: int) -> int:
             f"\n---\n*arbiter: {persona.cli} · "
             f"{time.strftime('%Y-%m-%d %H:%M')}*"
         )
-        gh.comment(kind="pr", number=pr_number, body=body)
+        gh.comment(kind="pr", number=pr_number, body=body, as_cli=persona.cli)
 
         if parsed["verdict"] == "ESCALATE_TO_HUMAN":
-            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"))
+            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"), as_cli=persona.cli)
         elif parsed["verdict"] == "APPROVE_FOR_MERGE":
             gh.comment(
-                kind="pr", number=pr_number,
+                kind="pr", number=pr_number, as_cli=persona.cli,
                 body=("##VERDICT: APPROVE\n"
                       "##SUMMARY: Arbiter override — see arbiter verdict above.\n"
                       "##CHECKLIST:\n- [x] Arbiter approved for merge\n"

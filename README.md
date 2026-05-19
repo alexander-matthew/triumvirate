@@ -91,6 +91,25 @@ uv run agent-loop halt        # engage all three kill switches
 uv run agent-loop journal     # tail recent runs.sqlite events
 ```
 
+## Bot identities (recommended)
+
+By default the loop runs under whatever `gh` login the host has on disk —
+which means commits, PRs, reviews, and labels all attribute to the human
+owner. Promote each CLI to its own GitHub App bot to fix that:
+
+```sh
+agent-loop bots add claude --app-id 123456 --pem-file ~/Downloads/claude-bot.pem
+agent-loop bots add codex  --app-id 234567 --pem-file ~/Downloads/codex-bot.pem
+agent-loop bots add gemini --app-id 345678 --pem-file ~/Downloads/gemini-bot.pem
+agent-loop bots list
+agent-loop bots test claude     # mint a token + probe the API
+```
+
+Full walk-through (create the three apps in the GitHub UI, choose
+permissions, install on the repo, rotate keys) is in
+[BOTS.md](BOTS.md). Without bots configured the loop falls back to host
+`gh` auth, so this is fully opt-in.
+
 ## Guard rails
 
 Designed to be **fully autonomous on merge**, so the guard rails matter.

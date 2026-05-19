@@ -104,7 +104,8 @@ def evaluate(pr_number: int) -> int:
     started = time.time()
     db.append(phase="merge", action="start", pr_number=pr_number)
     try:
-        gh.merge_pr(number=pr_number, method="squash")
+        # Merge as the engineer's bot (claude) — the PR is theirs.
+        gh.merge_pr(number=pr_number, method="squash", as_cli="claude")
     except Exception as e:
         db.append(phase="merge", action="error", pr_number=pr_number,
                   duration_s=time.time() - started,

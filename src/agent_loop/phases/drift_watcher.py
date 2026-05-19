@@ -52,7 +52,7 @@ def run() -> int:
 
     worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"drift-{int(started)}", base="origin/main")
+        worktree = git_worktree.create(f"drift-{int(started)}", base="origin/main", as_cli=persona.cli)
         prompt = persona.render()
         run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
         duration = run_.duration_s
@@ -88,7 +88,7 @@ def run() -> int:
                     "--title", p["title"],
                     "--body", p["body"],
                     *sum([["--label", l] for l in labels], []),
-                ])
+                ], as_cli=persona.cli)
                 num = int(out.strip().rsplit("/", 1)[-1])
                 filed.append(num)
             except Exception as e:

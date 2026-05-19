@@ -1,11 +1,22 @@
-"""Thin wrappers around the `gh` CLI. All shell-out, no Python GitHub libs."""
+"""Thin wrappers around the `gh` CLI. All shell-out, no Python GitHub libs.
+
+Identity model: read-only calls (list_*, get_*, pr_diff, marker_posts) run
+under whatever auth `gh` finds on disk — typically the human owner's host
+`gh` login. Mutating calls accept `as_cli=<claude|codex|gemini>` so writes
+attribute to the matching GitHub App bot via a short-lived installation
+token injected as GH_TOKEN. If `as_cli` is omitted, the call falls back to
+the host's `gh` auth — useful before bots are set up.
+"""
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
-from typing import Any
+from typing import Any, Optional
+
+from . import bots
 
 
 class GhError(RuntimeError):
@@ -31,14 +42,43 @@ def _is_transient(stderr: str) -> bool:
     return bool(_TRANSIENT.search(stderr or ""))
 
 
-def _run(args: list[str], *, check: bool = True, input_: str | None = None) -> str:
+def _env_for(as_cli: Optional[str]) -> dict[str, str]:
+    """Build the env that scopes a `gh` call to a specific bot, or to the host.
+
+    When `as_cli` is set, GH_TOKEN overrides any cached `gh auth` login —
+    the call attributes to that bot. When None, we drop GH_TOKEN entirely
+    so `gh` falls back to its own keychain (the human owner's login).
+    """
+    env = os.environ.copy()
+    if as_cli:
+        from ..config import settings as _settings
+        repo = _settings().repo
+        if not repo:
+            raise GhError(f"as_cli={as_cli!r} requires [project].repo in config.toml")
+        env["GH_TOKEN"] = bots.mint_installation_token(as_cli, repo=repo)
+        # Belt-and-suspenders: also unset the user-level token so it can't win.
+        env.pop("GITHUB_TOKEN", None)
+    else:
+        # Leave the inherited env alone so `gh auth status` works.
+        pass
+    return env
+
+
+def _run(
+    args: list[str], *,
+    check: bool = True,
+    input_: str | None = None,
+    as_cli: Optional[str] = None,
+) -> str:
     last_stderr = ""
+    env = _env_for(as_cli)
     for attempt in range(len(_RETRY_DELAYS_S) + 1):
         proc = subprocess.run(
             ["gh", *args],
             capture_output=True,
             text=True,
             input=input_,
+            env=env,
         )
         if proc.returncode == 0:
             return proc.stdout
@@ -139,31 +179,43 @@ def marker_posts(pr: dict, marker: str = "##VERDICT:") -> list[dict]:
 # ---- mutations -------------------------------------------------------------
 
 
-def add_label(*, kind: str, number: int, label: str) -> None:
-    """kind: 'issue' or 'pr'."""
-    _run([kind, "edit", str(number), "--add-label", label])
+def add_label(*, kind: str, number: int, label: str, as_cli: Optional[str] = None) -> None:
+    """kind: 'issue' or 'pr'. Uses the REST issues-labels endpoint, NOT
+    `gh pr edit --add-label` — the latter goes through GraphQL and aborts on
+    the (harmless) classic-Projects deprecation warning.
+    """
+    from ..config import settings as _settings
+    repo = _settings().repo
+    _run(["api", "-X", "POST",
+          f"repos/{repo}/issues/{number}/labels",
+          "-f", f"labels[]={label}"], as_cli=as_cli)
 
 
-def remove_label(*, kind: str, number: int, label: str) -> None:
+def remove_label(*, kind: str, number: int, label: str, as_cli: Optional[str] = None) -> None:
+    """Same rationale as add_label — REST DELETE on the labels endpoint."""
+    from ..config import settings as _settings
+    repo = _settings().repo
     proc = subprocess.run(
-        ["gh", kind, "edit", str(number), "--remove-label", label],
-        capture_output=True, text=True,
+        ["gh", "api", "-X", "DELETE",
+         f"repos/{repo}/issues/{number}/labels/{label}"],
+        capture_output=True, text=True, env=_env_for(as_cli),
     )
-    if proc.returncode != 0 and "not found" not in proc.stderr.lower():
-        raise GhError(f"gh {kind} edit --remove-label: {proc.stderr.strip()}")
+    if proc.returncode != 0 and "not found" not in proc.stderr.lower() \
+            and "label does not exist" not in proc.stderr.lower():
+        raise GhError(f"gh api DELETE labels: {proc.stderr.strip()}")
 
 
-def comment(*, kind: str, number: int, body: str) -> None:
-    _run([kind, "comment", str(number), "--body", body])
+def comment(*, kind: str, number: int, body: str, as_cli: Optional[str] = None) -> None:
+    _run([kind, "comment", str(number), "--body", body], as_cli=as_cli)
 
 
-def review(*, pr_number: int, verdict: str, body: str) -> None:
+def review(*, pr_number: int, verdict: str, body: str, as_cli: Optional[str] = None) -> None:
     """Post a review. Verdict ∈ {'approve','request-changes','comment'}.
 
-    GitHub blocks reviewing your own PRs, so when the worker + reviewer share
-    auth we fall back to `gh pr comment` and rely on the ##VERDICT: marker
-    in the body for readers to find it. Promote the reviewer to a dedicated
-    bot identity to recover formal-review semantics.
+    With bots configured, the reviewer's `as_cli` should differ from the
+    engineer's, so GitHub's self-review block doesn't fire. The fallback
+    to a plain comment with a ##VERDICT marker remains as a safety net for
+    the bots-not-yet-configured transition.
     """
     flag = {
         "approve": "--approve",
@@ -172,14 +224,14 @@ def review(*, pr_number: int, verdict: str, body: str) -> None:
     }[verdict]
     proc = subprocess.run(
         ["gh", "pr", "review", str(pr_number), flag, "--body", body],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_env_for(as_cli),
     )
     if proc.returncode == 0:
         return
     err = proc.stderr.lower()
     if "your own pull request" in err or "cannot be reviewed" in err:
         comment(
-            kind="pr", number=pr_number,
+            kind="pr", number=pr_number, as_cli=as_cli,
             body=f"_(reviewer agent — posted as comment because GitHub blocks self-review)_\n\n{body}",
         )
         return
@@ -193,14 +245,15 @@ def list_pr_comments(pr_number: int) -> list[dict]:
     ]).get("comments", []) or []
 
 
-def create_pr(*, head: str, base: str, title: str, body: str, labels: list[str]) -> int:
+def create_pr(*, head: str, base: str, title: str, body: str, labels: list[str],
+              as_cli: Optional[str] = None) -> int:
     args = ["pr", "create", "--head", head, "--base", base,
             "--title", title, "--body", body]
     for lbl in labels:
         args += ["--label", lbl]
-    url = _run(args).strip()
+    url = _run(args, as_cli=as_cli).strip()
     return int(url.rsplit("/", 1)[-1])
 
 
-def merge_pr(*, number: int, method: str = "squash") -> None:
-    _run(["pr", "merge", str(number), f"--{method}", "--delete-branch"])
+def merge_pr(*, number: int, method: str = "squash", as_cli: Optional[str] = None) -> None:
+    _run(["pr", "merge", str(number), f"--{method}", "--delete-branch"], as_cli=as_cli)
