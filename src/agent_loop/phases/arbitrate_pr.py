@@ -2,31 +2,13 @@
 from __future__ import annotations
 
 import re
-import subprocess
 import time
-from pathlib import Path
 
 from ..config import settings
-from ..lib import agent_run, db, gh, git_worktree, kill_switch, quota, rotation, trust
+from ..lib import agent_run, db, gh, kill_switch, quota, rotation, trust
 from ..lib.persona import Persona
-
-
-_VERDICT = re.compile(
-    r"^##ARBITER_VERDICT:\s*(APPROVE_FOR_MERGE|REQUEST_FINAL_CHANGES|ESCALATE_TO_HUMAN)\s*$",
-    re.M,
-)
-_REASONING = re.compile(r"^##REASONING:\s*\n(.*?)\Z", re.M | re.S)
-
-
-def _parse(text: str) -> dict | None:
-    v = _VERDICT.search(text or "")
-    r = _REASONING.search(text or "")
-    if not v:
-        return None
-    return {
-        "verdict": v.group(1),
-        "reasoning": r.group(1).strip() if r else "(no reasoning block)",
-    }
+from ..lib.phase_runtime import isolated_worktree
+from ..lib.verdicts import ArbiterVerdict, ParseError, ReviewVerdict
 
 
 def _extract_issue_ref(pr_body: str) -> int | None:
@@ -89,78 +71,92 @@ def arbitrate(pr_number: int) -> int:
     db.append(phase="arbitrate", action="start", agent=persona.cli,
               pr_number=pr_number, notes={"persona": persona.name})
     branch = pr.get("headRefName", "")
-    worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"arbitrate-{pr_number}", base="origin/main", as_cli=persona.cli)
-        subprocess.run(["git", "fetch", "origin", f"{branch}:{branch}", "--force"],
-                       cwd=worktree, check=True, capture_output=True)
-        subprocess.run(["git", "checkout", branch],
-                       cwd=worktree, check=True, capture_output=True)
-
-        prompt = persona.render(
-            PR_NUMBER=pr["number"],
-            PR_TITLE=pr["title"],
-            ISSUE_NUMBER=issue_n or "?",
-            ADDITIONS=pr.get("additions", 0),
-            DELETIONS=pr.get("deletions", 0),
-            CHANGED_FILES=pr.get("changedFiles", 0),
-            ISSUE_BODY=trust.wrap_untrusted(f"issue #{issue_n} body", issue_body),
-            REVIEW_HISTORY=_build_review_history(pr),
-        )
-
-        run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
-        duration = run_.duration_s
-
-        if run_.rate_limited:
-            db.append(phase="arbitrate", action="error", agent=persona.cli,
-                      pr_number=pr_number, duration_s=duration,
-                      outcome="rate_limited",
-                      notes={"retry_after_ts": run_.retry_after_ts})
-            return 1
-        if run_.timed_out:
-            db.append(phase="arbitrate", action="error", agent=persona.cli,
-                      pr_number=pr_number, duration_s=duration,
-                      exit_code=run_.returncode, outcome="timed_out")
-            return 2
-
-        parsed = _parse(run_.final_message)
-        if not parsed:
-            db.append(phase="arbitrate", action="error", agent=persona.cli,
-                      pr_number=pr_number, duration_s=duration,
-                      exit_code=run_.returncode, outcome="parse_failed",
-                      notes={"stdout_tail": run_.stdout[-1500:],
-                             "stderr_tail": run_.stderr[-1500:]})
-            return 2
-
-        body = (
-            f"##ARBITER_VERDICT: {parsed['verdict']}\n"
-            f"##REASONING:\n{parsed['reasoning']}\n"
-            f"\n---\n*arbiter: {persona.cli} · "
-            f"{time.strftime('%Y-%m-%d %H:%M')}*"
-        )
-        gh.comment(kind="pr", number=pr_number, body=body, as_cli=persona.cli)
-
-        if parsed["verdict"] == "ESCALATE_TO_HUMAN":
-            gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"), as_cli=persona.cli)
-        elif parsed["verdict"] == "APPROVE_FOR_MERGE":
-            gh.comment(
-                kind="pr", number=pr_number, as_cli=persona.cli,
-                body=("##VERDICT: APPROVE\n"
-                      "##SUMMARY: Arbiter override — see arbiter verdict above.\n"
-                      "##CHECKLIST:\n- [x] Arbiter approved for merge\n"
-                      "##NOTES:\nThis APPROVE is posted by the arbiter wrapper "
-                      "to satisfy the merge-gate's latest-verdict check. The "
-                      "arbiter's full reasoning is in the comment immediately "
-                      "above this one.\n"
-                      f"\n---\n*arbiter override · {persona.cli}*"),
+        with isolated_worktree(
+            f"arbitrate-{pr_number}",
+            as_cli=persona.cli,
+            checkout_branch=branch,
+        ) as worktree:
+            prompt = persona.render(
+                PR_NUMBER=pr["number"],
+                PR_TITLE=pr["title"],
+                ISSUE_NUMBER=issue_n or "?",
+                ADDITIONS=pr.get("additions", 0),
+                DELETIONS=pr.get("deletions", 0),
+                CHANGED_FILES=pr.get("changedFiles", 0),
+                ISSUE_BODY=trust.wrap_untrusted(f"issue #{issue_n} body", issue_body),
+                REVIEW_HISTORY=_build_review_history(pr),
             )
 
-        db.append(phase="arbitrate", action="finish", agent=persona.cli,
-                  pr_number=pr_number, duration_s=duration,
-                  outcome=parsed["verdict"].lower(),
-                  notes={"persona": persona.name,
-                         "reasoning": parsed["reasoning"][:1000]})
-        return 0
+            run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
+            duration = run_.duration_s
+
+            if run_.rate_limited:
+                db.append(phase="arbitrate", action="error", agent=persona.cli,
+                          pr_number=pr_number, duration_s=duration,
+                          outcome="rate_limited",
+                          notes={"retry_after_ts": run_.retry_after_ts})
+                return 1
+            if run_.timed_out:
+                db.append(phase="arbitrate", action="error", agent=persona.cli,
+                          pr_number=pr_number, duration_s=duration,
+                          exit_code=run_.returncode, outcome="timed_out")
+                return 2
+
+            try:
+                parsed = ArbiterVerdict.parse(run_.final_message)
+            except ParseError as e:
+                db.append(phase="arbitrate", action="error", agent=persona.cli,
+                          pr_number=pr_number, duration_s=duration,
+                          exit_code=run_.returncode, outcome="parse_failed",
+                          notes={"stdout_tail": run_.stdout[-1500:],
+                                 "stderr_tail": run_.stderr[-1500:],
+                                 "parse_error": str(e)})
+                return 2
+
+            # Default the reasoning section if the arbiter omitted it (the schema
+            # leaves REASONING optional but the human-readable comment shouldn't
+            # leave readers wondering).
+            reasoning = parsed.reasoning or "(no reasoning block)"
+            body = ArbiterVerdict(verdict=parsed.verdict, reasoning=reasoning).render() + (
+                f"\n---\n*arbiter: {persona.cli} · "
+                f"{time.strftime('%Y-%m-%d %H:%M')}*"
+            )
+            gh.comment(kind="pr", number=pr_number, body=body, as_cli=persona.cli)
+
+            db.record_verdict(
+                pr_number=pr_number,
+                marker_type="arbiter",
+                cli=persona.cli,
+                verdict=parsed.verdict,
+                raw_body=body,
+            )
+
+            if parsed.verdict == "ESCALATE_TO_HUMAN":
+                gh.add_label(kind="pr", number=pr_number, label=s.label("needs_human"), as_cli=persona.cli)
+            elif parsed.verdict == "APPROVE_FOR_MERGE":
+                # Post a synthetic ##VERDICT: APPROVE so the merge-gate's
+                # latest-verdict check sees consensus. PRView filters these
+                # out of the reviewer stream by detecting the
+                # [wrapper:arbiter-override] sentinel — a bracketed token
+                # that cannot appear in normal prose.
+                override_body = ReviewVerdict(
+                    verdict="APPROVE",
+                    summary="Arbiter override — see arbiter verdict above.",
+                    checklist="- [x] Arbiter approved for merge",
+                    notes=("This APPROVE is posted by the arbiter wrapper to satisfy "
+                           "the merge-gate's latest-verdict check. The arbiter's "
+                           "full reasoning is in the comment immediately above this one.\n"
+                           "[wrapper:arbiter-override]"),
+                ).render() + f"\n---\n*arbiter override · {persona.cli}*"
+                gh.comment(kind="pr", number=pr_number, as_cli=persona.cli, body=override_body)
+
+            db.append(phase="arbitrate", action="finish", agent=persona.cli,
+                      pr_number=pr_number, duration_s=duration,
+                      outcome=parsed.verdict.lower(),
+                      notes={"persona": persona.name,
+                             "reasoning": reasoning[:1000]})
+            return 0
 
     except kill_switch.HaltRequested as e:
         db.append(phase="arbitrate", action="halted", agent=persona.cli,
@@ -170,6 +166,3 @@ def arbitrate(pr_number: int) -> int:
         db.append(phase="arbitrate", action="error", agent=persona.cli,
                   pr_number=pr_number, notes={"error": repr(e)})
         return 2
-    finally:
-        if worktree is not None:
-            git_worktree.cleanup(worktree, delete_branch=True)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 
 from ..config import settings
-from ..lib import db, gh, kill_switch, protected, review_baton, rotation
+from ..lib import db, gh, kill_switch, protected, review_baton, rotation, transcripts
 
 
 def _ci_state(pr: dict) -> str:
@@ -115,4 +115,10 @@ def evaluate(pr_number: int) -> int:
     db.append(phase="merge", action="finish", pr_number=pr_number,
               outcome="merged", duration_s=time.time() - started)
     review_baton.clear(pr_number)
+    try:
+        transcripts.write(pr_number, title=pr.get("title"))
+    except Exception as e:
+        # Transcript failure must not fail a successful merge.
+        db.append(phase="merge", action="error", pr_number=pr_number,
+                  outcome="transcript_failed", notes={"error": repr(e)})
     return 0
