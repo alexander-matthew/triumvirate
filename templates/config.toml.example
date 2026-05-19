@@ -73,6 +73,33 @@ trigger_paths = [
 required_clis = ["codex", "gemini"]
 
 
+[phases]
+# Which phases the orchestrator is allowed to dispatch. Omit this section
+# to enable everything (the default). List only the phases you want for a
+# minimal loop. Disabling a phase causes the dispatch state machine to
+# skip past it: e.g. disabling "security" sends APPROVE'd PRs straight to
+# the librarian check (or to merge if librarian is also off).
+#
+# All phases:
+#   work       — engineer implements an approved issue → opens PR
+#   review     — reviewer-codex / reviewer-gemini reviews a PR
+#   respond    — engineer addresses reviewer REQUEST_CHANGES
+#   arbitrate  — tiebreaker when consensus fails or rounds capped
+#   security   — pre-merge adversarial scan (Gemini)
+#   librarian  — pre-merge cross-project consistency audit (Gemini)
+#   merge      — auto-merge once gates green
+#   propose    — daily proposer files spec issues (Claude)
+#   triage     — daily triage auto-approves low-risk specs (Gemini)
+#   drift      — weekly architectural drift sweep (Claude)
+#   synthesis  — weekly self-improvement pass: read the arbiter log + verdict
+#                distributions, propose persona-prompt edits as proposals
+enabled = [
+    "work", "review", "respond", "arbitrate", "merge",
+    "security", "librarian",
+    "propose", "triage", "drift", "synthesis",
+]
+
+
 [paths]
 # Project-relative paths the framework expects.
 personas_dir = "agents/personas"

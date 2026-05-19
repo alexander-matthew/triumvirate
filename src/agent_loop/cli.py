@@ -111,6 +111,88 @@ def cmd_status(_args: argparse.Namespace) -> int:
         width = max(len(k) for k in summary)
         for k, c in sorted(summary.items()):
             print(f"  {k:<{width}}  {c}")
+
+    _section("Next planned action")
+    try:
+        from .orchestrator import plan
+        _print_decision(plan(), prefix="Next tick")
+    except Exception as e:
+        print(_dim(f"  (plan() failed: {e!r})"))
+    return 0
+
+
+def cmd_metrics(_args: argparse.Namespace) -> int:
+    """Verdict-distribution metrics from the local runs.sqlite."""
+    s = settings()
+    ensure_state_dir()
+
+    _section("Reviewer verdicts (APPROVE rate per CLI)")
+    review_dist = db.verdict_distribution("review")
+    if not review_dist:
+        print(_dim("  (no reviewer verdicts recorded yet)"))
+    else:
+        width = max(len(c) for c in review_dist)
+        for cli in sorted(review_dist):
+            counts = review_dist[cli]
+            total = sum(counts.values())
+            approved = counts.get("APPROVE", 0)
+            pct = (approved / total * 100) if total else 0.0
+            breakdown = ", ".join(
+                f"{v}={counts[v]}" for v in sorted(counts)
+            )
+            print(f"  {cli:<{width}}  APPROVE {approved}/{total} ({pct:5.1f}%)  · {breakdown}")
+
+    _section("Arbiter pick distribution")
+    arb_dist = db.verdict_distribution("arbiter")
+    if not arb_dist:
+        print(_dim("  (no arbiter verdicts recorded yet)"))
+    else:
+        total = sum(sum(c.values()) for c in arb_dist.values())
+        for cli in sorted(arb_dist):
+            cli_total = sum(arb_dist[cli].values())
+            pct = (cli_total / total * 100) if total else 0.0
+            breakdown = ", ".join(
+                f"{v}={arb_dist[cli][v]}" for v in sorted(arb_dist[cli])
+            )
+            print(f"  {cli:<7}  {cli_total} pick(s) ({pct:5.1f}%)  · {breakdown}")
+
+    _section("Security verdicts")
+    sec_dist = db.verdict_distribution("security")
+    if not sec_dist:
+        print(_dim("  (none recorded)"))
+    else:
+        for cli in sorted(sec_dist):
+            counts = sec_dist[cli]
+            total = sum(counts.values())
+            flagged = counts.get("FLAG", 0)
+            pct = (flagged / total * 100) if total else 0.0
+            print(f"  {cli:<7}  FLAG {flagged}/{total} ({pct:5.1f}%)")
+
+    _section("Librarian verdicts")
+    aud_dist = db.verdict_distribution("audit")
+    if not aud_dist:
+        print(_dim("  (none recorded)"))
+    else:
+        for cli in sorted(aud_dist):
+            counts = aud_dist[cli]
+            total = sum(counts.values())
+            failed = counts.get("AUDIT_FAIL", 0)
+            pct = (failed / total * 100) if total else 0.0
+            print(f"  {cli:<7}  AUDIT_FAIL {failed}/{total} ({pct:5.1f}%)")
+
+    _section("Rounds to consensus")
+    rounds = db.consensus_rounds(s.required_reviewer_clis)
+    if not rounds:
+        print(_dim("  (no PR has reached consensus yet)"))
+    else:
+        mean = sum(rounds) / len(rounds)
+        print(f"  {len(rounds)} PR(s) reached consensus")
+        print(f"  mean rounds: {mean:.2f}   min: {min(rounds)}   max: {max(rounds)}")
+        hist: dict[int, int] = {}
+        for r in rounds:
+            hist[r] = hist.get(r, 0) + 1
+        for r in sorted(hist):
+            print(f"    round {r}: {'█' * hist[r]} ({hist[r]})")
     return 0
 
 
@@ -136,8 +218,30 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if getattr(args, "force", False):
         os.environ["LOOP_FORCE_OFF_HOURS"] = "1"
         print(_warn("  · forcing off-hours gate open for this tick"))
+    if getattr(args, "dry_run", False):
+        from .orchestrator import plan
+        decision = plan()
+        _print_decision(decision, prefix="Would run")
+        return 0
     from .orchestrator import one_tick
     return one_tick()
+
+
+def _print_decision(decision, *, prefix: str) -> None:
+    """Pretty-print a PhaseDecision (from orchestrator.plan)."""
+    label = decision.phase if decision.phase != "noop" else _dim("noop")
+    if decision.target is not None:
+        tgt = f" (target #{decision.target}"
+        if decision.cli:
+            tgt += f", cli={decision.cli}"
+        tgt += ")"
+    else:
+        tgt = ""
+    if decision.phase == "noop":
+        print(f"  {prefix}: {label}{tgt}")
+    else:
+        print(f"  {prefix}: {_ok(label)}{tgt}")
+    print(_dim(f"      reason: {decision.reason}"))
 
 
 def cmd_daemon(_args: argparse.Namespace) -> int:
@@ -348,8 +452,13 @@ def main() -> int:
     t = sub.add_parser("tick", help="force one state-machine step now")
     t.add_argument("--force", action="store_true",
                    help="bypass the off-hours gate (for daytime testing)")
+    t.add_argument("--dry-run", action="store_true",
+                   help="print what the next tick would dispatch, without running it")
     t.set_defaults(fn=cmd_tick)
     sub.add_parser("status", help="show pipeline state").set_defaults(fn=cmd_status)
+    sub.add_parser("metrics",
+                   help="verdict distributions + consensus stats from runs.sqlite"
+                   ).set_defaults(fn=cmd_metrics)
     j = sub.add_parser("journal", help="recent runs.sqlite events")
     j.add_argument("--limit", type=int, default=30)
     j.set_defaults(fn=cmd_journal)

@@ -8,12 +8,13 @@ from pathlib import Path
 
 from ..config import settings
 from ..lib import agent_run, db, gh, git_worktree, kill_switch, protected, quota
+from ..lib.markers import Marker, Section, extract_block, extract_inline
 from ..lib.persona import Persona
 
 
 def _latest_codex_review(pr: dict) -> dict | None:
     """The most recent review-or-comment carrying the structured marker."""
-    posts = gh.marker_posts(pr)
+    posts = gh.marker_posts(pr, marker=Marker.REVIEW)
     if not posts:
         return None
     p = posts[-1]
@@ -21,15 +22,23 @@ def _latest_codex_review(pr: dict) -> dict | None:
 
 
 def _parse_review_body(body: str) -> dict:
-    v = re.search(r"^##VERDICT:\s*(\S+)", body, re.M)
-    s = re.search(r"^##SUMMARY:\s*(.+)$", body, re.M)
-    c = re.search(r"^##CHECKLIST:\s*\n(.*?)(?=^##|\Z)", body, re.M | re.S)
-    n = re.search(r"^##NOTES:\s*\n(.*?)(?=^---|\Z)", body, re.M | re.S)
+    """Tolerant parser for use in prompt-building.
+
+    Unlike :class:`ReviewVerdict.parse` (which is strict because it
+    governs what enters the merge gate), this returns empty strings for
+    any missing section — we only need the parts of the review the
+    engineer should see in their prompt, and a stale/half-formed comment
+    body should not crash the responder phase.
+
+    The wrapper appends a ``\\n---\\n*Round N/M · reviewer: ...*`` trailer
+    after the verdict; split it off so it doesn't get slurped into NOTES.
+    """
+    verdict_body = body.split("\n---\n", 1)[0]
     return {
-        "verdict": v.group(1) if v else "",
-        "summary": s.group(1).strip() if s else "",
-        "checklist": c.group(1).strip() if c else "",
-        "notes": n.group(1).strip() if n else "",
+        "verdict": extract_inline(verdict_body, Section.VERDICT) or "",
+        "summary": extract_inline(verdict_body, Section.SUMMARY) or "",
+        "checklist": extract_block(verdict_body, Section.CHECKLIST) or "",
+        "notes": extract_block(verdict_body, Section.NOTES) or "",
     }
 
 

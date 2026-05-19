@@ -20,20 +20,21 @@ from __future__ import annotations
 import datetime as dt
 import fcntl
 import os
-import re
 import signal
 import sys
 import time
+from dataclasses import dataclass
 
-from .config import settings
+from .config import Settings, settings
 from .lib import db, gh, kill_switch, quota, rotation
 from .lib.paths import ensure_state_dir
 from .lib.persona import Persona
+from .lib.pr_view import PRView
 
 from .phases import (
-    arbitrate_pr, drift_watcher, librarian_check, merge_gate,
-    propose_issues, respond_to_review, review_pr, security_check,
-    triage_proposals, work_issue,
+    arbitrate_pr, librarian_check, merge_gate,
+    respond_to_review, review_pr, security_check, spec_writer,
+    synthesis as synthesis_phase, triage_proposals, work_issue,
 )
 
 
@@ -90,65 +91,31 @@ def _drift_ran_this_week() -> bool:
     return False
 
 
-# ---- PR classification ----------------------------------------------------
-
-
-def _is_arbiter_override(post: dict) -> bool:
-    return "Arbiter override" in post["body"]
-
-
-def _latest_codex_verdict(pr: dict) -> str | None:
-    posts = [p for p in gh.marker_posts(pr) if not _is_arbiter_override(p)]
-    if not posts:
-        return None
-    m = re.search(r"##VERDICT:\s*(\S+)", posts[-1]["body"])
-    return m.group(1) if m else None
-
-
-def _latest_arbiter_verdict(pr: dict) -> tuple[str | None, str | None]:
-    posts = gh.marker_posts(pr, marker="##ARBITER_VERDICT:")
-    if not posts:
-        return None, None
-    m = re.search(r"##ARBITER_VERDICT:\s*(\S+)", posts[-1]["body"])
-    return (m.group(1) if m else None), posts[-1]["ts"]
-
-
-def _reviewer_rounds(pr: dict) -> int:
-    return len([p for p in gh.marker_posts(pr) if not _is_arbiter_override(p)])
-
-
-def _commits_since_review(pr: dict) -> bool:
-    posts = [p for p in gh.marker_posts(pr) if not _is_arbiter_override(p)]
-    if not posts:
-        return True
-    last_ts = posts[-1]["ts"]
-    commits = pr.get("commits") or []
-    if not commits:
-        return False
-    return (commits[-1].get("committedDate") or "") > last_ts
-
-
-def _commits_since_arbiter(pr: dict) -> bool:
-    _, arb_ts = _latest_arbiter_verdict(pr)
-    if not arb_ts:
-        return False
-    commits = pr.get("commits") or []
-    if not commits:
-        return False
-    return (commits[-1].get("committedDate") or "") > arb_ts
-
-
-def _is_agent_pr(pr: dict) -> bool:
-    return any(l["name"].startswith("agent:") for l in pr.get("labels", []))
-
-
-def _is_stalled(pr: dict) -> bool:
-    s = settings()
-    bad = {s.label("needs_human"), s.label("veto"), s.label("protected_violation")}
-    return any(l["name"] in bad for l in pr.get("labels", []))
+def _synthesis_ran_this_week() -> bool:
+    week_ago = time.time() - 7 * 86400
+    for ev in db.recent(500):
+        if (ev["phase"] == "synthesis" and ev["action"] in {"finish", "skip"}
+                and ev["ts"] >= week_ago):
+            return True
+    return False
 
 
 # ---- the state machine ----------------------------------------------------
+
+
+def _stalled_labels() -> frozenset[str]:
+    s = settings()
+    return frozenset({s.label("needs_human"), s.label("veto"), s.label("protected_violation")})
+
+
+def _is_agent_pr_listing(pr: dict) -> bool:
+    """Cheap label-only check against the list_prs() payload (no commits/comments)."""
+    return any(l["name"].startswith("agent:") for l in pr.get("labels", []))
+
+
+def _is_stalled_listing(pr: dict) -> bool:
+    bad = _stalled_labels()
+    return any(l["name"] in bad for l in pr.get("labels", []))
 
 
 def _persona_blocked(persona_name: str) -> bool:
@@ -157,113 +124,221 @@ def _persona_blocked(persona_name: str) -> bool:
     return blocked
 
 
-def _dispatch() -> tuple[str, int | None]:
+# ---- plan + execute -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PhaseDecision:
+    """What the orchestrator would do next.
+
+    Returned by :func:`plan` and consumed by :func:`execute`. Splitting the
+    state machine into a pure decision step + an effect step makes the
+    state machine unit-testable and lets the CLI offer a ``--dry-run``
+    that prints what *would* happen without burning agent budget.
+
+    ``phase`` matches the dispatch tag (``review``, ``arbitrate``, ...,
+    or ``noop`` when nothing actionable). ``target`` is the PR or issue
+    number when phase-relevant. ``reason`` is a human-readable
+    explanation suitable for ``status`` output. ``cli`` is set for phases
+    that pick one of several reviewer/arbiter CLIs upfront so execute
+    doesn't redo the choice.
+    """
+
+    phase: str
+    target: int | None
+    reason: str
+    cli: str | None = None
+
+
+def plan() -> PhaseDecision:
+    """Decide what one tick would do, without taking any action.
+
+    Pure with respect to side effects on GitHub or local state. Still
+    reads GitHub state and rate-limit DB. Returns a single
+    :class:`PhaseDecision`; ``phase == "noop"`` means nothing actionable.
+    """
     s = settings()
 
     open_prs = gh.list_prs(state="open", limit=50)
-    candidates = [p for p in open_prs if _is_agent_pr(p) and not _is_stalled(p)]
+    candidates = [p for p in open_prs
+                  if _is_agent_pr_listing(p) and not _is_stalled_listing(p)]
     candidates.sort(key=lambda p: p["createdAt"])
-    agent_prs = [gh.get_pr(p["number"]) for p in candidates]
+    views = [PRView.from_pr(gh.get_pr(p["number"])) for p in candidates]
 
-    for pr in agent_prs:
-        pr_number = pr["number"]
-        verdicts = rotation.reviewer_verdicts(pr_number)
-        pending = rotation.pending_reviewer_clis(pr_number)
-        verdict = _latest_codex_verdict(pr)
-        arb_verdict, _ = _latest_arbiter_verdict(pr)
+    for view in views:
+        decision = _plan_pr(view, s)
+        if decision is not None:
+            return decision
 
-        # ---- arbiter has spoken ----
-        if arb_verdict is not None:
-            if arb_verdict == "REQUEST_FINAL_CHANGES":
-                if _commits_since_arbiter(pr):
-                    rc = arbitrate_pr.arbitrate(pr_number)
-                    return ("arbitrate", pr_number) if rc == 0 else ("arbitrate.skip", pr_number)
-                if _persona_blocked("engineer"):
-                    continue
-                rc = respond_to_review.respond(pr_number)
-                return ("respond", pr_number) if rc == 0 else ("respond.skip", pr_number)
+    return _plan_off_hours(s)
 
-        # ---- reviewer round-cap reached without convergence → invoke arbiter ----
-        has_request_changes = any(v == "REQUEST_CHANGES" for v in verdicts.values())
-        if (has_request_changes
-                and _reviewer_rounds(pr) >= s.max_review_rounds
-                and not pending
-                and arb_verdict is None):
-            rc = arbitrate_pr.arbitrate(pr_number)
-            return ("arbitrate", pr_number) if rc == 0 else ("arbitrate.skip", pr_number)
 
-        # ---- normal flow ----
+def _plan_pr(view: PRView, s: Settings) -> PhaseDecision | None:
+    """Decide what (if anything) to do for one candidate PR.
 
-        # 1. Pending reviewers → dispatch one.
-        if pending:
-            chosen = rotation.pick_reviewer_cli(pr_number)
-            if chosen and not _persona_blocked(rotation.reviewer_persona_name(chosen)):
-                rc = review_pr.review(pr_number, cli=chosen)
-                return ("review", pr_number) if rc == 0 else ("review.skip", pr_number)
-            continue
+    Returns None if this PR has no actionable phase — caller should
+    advance to the next candidate.
+    """
+    pr_number = view.number
+    verdicts = rotation.reviewer_verdicts(pr_number)
+    pending = rotation.pending_reviewer_clis(pr_number)
+    has_request_changes = any(v == "REQUEST_CHANGES" for v in verdicts.values())
 
-        # 2. All required reviews are in for the latest commit.
+    # ---- arbiter has spoken ----
+    if view.latest_arbiter_verdict == "REQUEST_FINAL_CHANGES":
+        if view.commits_since_arbiter and s.phase_enabled("arbitrate"):
+            return PhaseDecision("arbitrate", pr_number,
+                                 "new commits since arbiter REQUEST_FINAL_CHANGES")
+        if s.phase_enabled("respond") and not _persona_blocked("engineer"):
+            return PhaseDecision("respond", pr_number,
+                                 "arbiter REQUEST_FINAL_CHANGES; engineer addresses")
+        return None
 
-        # 2a. Any agent requested changes → engineer responds.
-        if has_request_changes:
-            if _persona_blocked("engineer"):
-                continue
-            rc = respond_to_review.respond(pr_number)
-            return ("respond", pr_number) if rc == 0 else ("respond.skip", pr_number)
+    # ---- reviewer round-cap reached without convergence → invoke arbiter ----
+    if (has_request_changes
+            and view.reviewer_rounds >= s.max_review_rounds
+            and not pending
+            and view.latest_arbiter_verdict is None
+            and s.phase_enabled("arbitrate")):
+        return PhaseDecision("arbitrate", pr_number,
+                             f"round cap reached ({view.reviewer_rounds}/{s.max_review_rounds})")
 
-        # 2b. Consensus APPROVE → security + librarian → merge.
-        if all(v == "APPROVE" for v in verdicts.values()) and verdicts:
-            labels = {l["name"] for l in pr.get("labels", [])}
-            if (s.label("security_cleared") not in labels
-                    and s.label("security_flag") not in labels):
-                if _persona_blocked("security"):
-                    continue
-                rc = security_check.check(pr_number)
-                return ("security", pr_number) if rc == 0 else ("security.skip", pr_number)
-            if (s.label("librarian_cleared") not in labels
-                    and s.label("librarian_flag") not in labels):
-                if _persona_blocked("librarian-gemini"):
-                    continue
-                rc = librarian_check.check(pr_number)
-                return ("librarian", pr_number) if rc == 0 else ("librarian.skip", pr_number)
-            rc = merge_gate.evaluate(pr_number)
-            return ("merge", pr_number) if rc == 0 else ("merge.skip", pr_number)
+    # ---- normal flow ----
 
-    # No PR work pending.
+    # 1. Pending reviewers → dispatch one.
+    if pending and s.phase_enabled("review"):
+        chosen = rotation.pick_reviewer_cli(pr_number)
+        if chosen and not _persona_blocked(rotation.reviewer_persona_name(chosen)):
+            return PhaseDecision("review", pr_number,
+                                 f"pending reviewer: {chosen}", cli=chosen)
+        return None
 
-    # Worker (off-hours).
-    if _is_off_hours() and not _persona_blocked("engineer"):
+    # 2a. Any agent requested changes → engineer responds.
+    if has_request_changes and s.phase_enabled("respond"):
+        if _persona_blocked("engineer"):
+            return None
+        return PhaseDecision("respond", pr_number,
+                             "reviewer(s) REQUEST_CHANGES; engineer addresses")
+
+    # 2b. Consensus APPROVE → security + librarian → merge.
+    if verdicts and all(v == "APPROVE" for v in verdicts.values()):
+        if s.phase_enabled("security") and not (
+                view.has_label(s.label("security_cleared"))
+                or view.has_label(s.label("security_flag"))):
+            if _persona_blocked("security"):
+                return None
+            return PhaseDecision("security", pr_number,
+                                 "consensus APPROVE; pre-merge security scan")
+        if s.phase_enabled("librarian") and not (
+                view.has_label(s.label("librarian_cleared"))
+                or view.has_label(s.label("librarian_flag"))):
+            if _persona_blocked("librarian-gemini"):
+                return None
+            return PhaseDecision("librarian", pr_number,
+                                 "consensus APPROVE; pre-merge librarian audit")
+        if s.phase_enabled("merge"):
+            return PhaseDecision("merge", pr_number, "consensus APPROVE; gates green")
+
+    return None
+
+
+def _plan_off_hours(s: Settings) -> PhaseDecision:
+    """Decide which off-hours phase to run when no PR work is pending."""
+    if (s.phase_enabled("work")
+            and _is_off_hours()
+            and not _persona_blocked("engineer")):
         approved = gh.list_issues(labels=[s.label("approved")], state="open", limit=5)
         if approved:
-            rc = work_issue.run()
-            return ("work", None) if rc == 0 else ("work.skip", None)
+            return PhaseDecision("work", None,
+                                 f"{len(approved)} approved issue(s) pending engineer")
 
-    # Proposer (once per day, off-hours).
-    if (_is_off_hours()
+    if (s.phase_enabled("propose")
+            and _is_off_hours()
             and not _proposer_ran_today()
             and not _persona_blocked("proposer")):
-        rc = propose_issues.run()
-        return ("propose", None) if rc == 0 else ("propose.skip", None)
+        return PhaseDecision("propose", None, "daily proposer hasn't run yet today")
 
-    # Triage (once per day, off-hours, after proposer).
-    if (_is_off_hours()
+    if (s.phase_enabled("triage")
+            and _is_off_hours()
             and not _triage_ran_today()
             and _proposer_ran_today()
             and not _persona_blocked("triage")):
         proposals = gh.list_issues(labels=[s.label("proposal")], state="open", limit=5)
         if proposals:
-            rc = triage_proposals.run()
-            return ("triage", None) if rc == 0 else ("triage.skip", None)
+            return PhaseDecision("triage", None,
+                                 f"{len(proposals)} proposal(s) await triage")
 
-    # Drift watcher (Sundays, off-hours).
-    if (_is_off_hours()
+    if (s.phase_enabled("drift")
+            and _is_off_hours()
             and dt.datetime.now().weekday() == 6
             and not _drift_ran_this_week()
             and not _persona_blocked("drift_watcher")):
-        rc = drift_watcher.run()
-        return ("drift", None) if rc == 0 else ("drift.skip", None)
+        return PhaseDecision("drift", None, "weekly drift sweep not yet run")
 
-    return ("noop", None)
+    if (s.phase_enabled("synthesis")
+            and _is_off_hours()
+            and dt.datetime.now().weekday() == 6
+            and not _synthesis_ran_this_week()
+            and not _persona_blocked("synthesis")):
+        return PhaseDecision("synthesis", None,
+                             "weekly self-improvement pass not yet run")
+
+    return PhaseDecision("noop", None, "no actionable work pending")
+
+
+def execute(decision: PhaseDecision) -> int:
+    """Run the phase named by ``decision`` and return its exit code.
+
+    The orchestrator dispatcher: ``one_tick`` calls ``plan()`` then
+    ``execute(...)``. Phases the wrapper invokes directly are pure
+    pass-through; ``noop`` is a no-op success.
+    """
+    target = decision.target
+    match decision.phase:
+        case "review":
+            assert target is not None and decision.cli is not None
+            return review_pr.review(target, cli=decision.cli)
+        case "arbitrate":
+            assert target is not None
+            return arbitrate_pr.arbitrate(target)
+        case "respond":
+            assert target is not None
+            return respond_to_review.respond(target)
+        case "security":
+            assert target is not None
+            return security_check.check(target)
+        case "librarian":
+            assert target is not None
+            return librarian_check.check(target)
+        case "merge":
+            assert target is not None
+            return merge_gate.evaluate(target)
+        case "work":
+            return work_issue.run()
+        case "propose":
+            return spec_writer.propose()
+        case "triage":
+            return triage_proposals.run()
+        case "drift":
+            return spec_writer.drift()
+        case "synthesis":
+            return synthesis_phase.run()
+        case "noop":
+            return 0
+        case _:
+            raise ValueError(f"unknown phase: {decision.phase!r}")
+
+
+def _dispatch() -> tuple[str, int | None]:
+    """Back-compat shim: legacy ``(phase, target)`` tuple from plan+execute.
+
+    The daemon and ``one_tick`` still log via this shape. New callers
+    should use ``plan()`` / ``execute()`` directly.
+    """
+    decision = plan()
+    rc = execute(decision)
+    suffix = "" if rc == 0 else ".skip"
+    return (f"{decision.phase}{suffix}", decision.target)
 
 
 def one_tick() -> int:
@@ -310,7 +385,7 @@ def daemon() -> int:
     while not _should_stop:
         if not _is_off_hours():
             agent_prs = [p for p in gh.list_prs(state="open", limit=50)
-                         if _is_agent_pr(p) and not _is_stalled(p)]
+                         if _is_agent_pr_listing(p) and not _is_stalled_listing(p)]
             if not agent_prs:
                 db.append(phase="tick", action="daemon_wrap", outcome="off_hours_done")
                 break

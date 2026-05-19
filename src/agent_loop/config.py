@@ -92,9 +92,13 @@ class Settings:
     protected_paths: tuple[str, ...]
     sensitive_path_prefixes: tuple[str, ...]   # security check
     librarian_trigger_paths: tuple[str, ...]   # cross-project check
+    requires_full_consensus_paths: tuple[str, ...]  # all three CLIs must APPROVE
 
     # --- reviewer consensus ---
     required_reviewer_clis: tuple[str, ...]
+
+    # --- phase enablement ---
+    enabled_phases: frozenset[str]  # set of phase tags the orchestrator may dispatch
 
     # --- labels ---
     labels: dict[str, str]          # logical name → actual GitHub label string
@@ -122,6 +126,17 @@ class Settings:
     def worktrees_dir(self) -> Path:
         return self.state_dir / "worktrees"
 
+    def phase_enabled(self, phase: str) -> bool:
+        """True if ``phase`` is in the configured enabled-phase set.
+
+        Phases are identified by the same tag used in dispatch / db rows:
+        ``work``, ``review``, ``respond``, ``arbitrate``, ``security``,
+        ``librarian``, ``merge``, ``propose``, ``triage``, ``drift``.
+        Projects opt out of optional phases by listing only the ones they
+        want in ``[phases].enabled``.
+        """
+        return phase in self.enabled_phases
+
     def label(self, name: str) -> str:
         """Look up an actual GitHub label string by logical name. Falls back
         to a sensible default if the project's config.toml didn't declare it.
@@ -132,6 +147,12 @@ class Settings:
           security_cleared, security_flag, librarian_cleared, librarian_flag.
         """
         return self.labels.get(name, _DEFAULT_LABELS[name])
+
+
+_ALL_PHASES = frozenset({
+    "work", "review", "respond", "arbitrate", "security",
+    "librarian", "merge", "propose", "triage", "drift", "synthesis",
+})
 
 
 _DEFAULT_LABELS = {
@@ -176,6 +197,7 @@ def load(config_path: Path | None = None) -> Settings:
     security = data.get("security", {})
     librarian = data.get("librarian", {})
     reviewers = data.get("reviewers", {})
+    phases_cfg = data.get("phases", {})
     labels = data.get("labels", {})
 
     # project_root: where the git repo lives. May be different from cfg_root
@@ -208,7 +230,11 @@ def load(config_path: Path | None = None) -> Settings:
         protected_paths=tuple(guards.get("protected_paths", ())),
         sensitive_path_prefixes=tuple(security.get("sensitive_path_prefixes", ())),
         librarian_trigger_paths=tuple(librarian.get("trigger_paths", ())),
+        requires_full_consensus_paths=tuple(
+            guards.get("requires_full_consensus_paths", ())
+        ),
         required_reviewer_clis=tuple(reviewers.get("required_clis", ("codex", "gemini"))),
+        enabled_phases=frozenset(phases_cfg.get("enabled", _ALL_PHASES)),
         labels={**_DEFAULT_LABELS, **labels},
         personas_dir=personas_dir.resolve(),
         state_dir=state_dir.resolve(),

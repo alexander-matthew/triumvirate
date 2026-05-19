@@ -16,7 +16,6 @@ from ..lib import (
     agent_run,
     db,
     gh,
-    git_worktree,
     kill_switch,
     protected,
     quota,
@@ -24,30 +23,8 @@ from ..lib import (
     rotation,
 )
 from ..lib.persona import Persona
-
-
-# ---- structured-output parsing --------------------------------------------
-
-
-_MARKER_VERDICT = re.compile(r"^##VERDICT:\s*(APPROVE|REQUEST_CHANGES|COMMENT)\s*$", re.M)
-_MARKER_SUMMARY = re.compile(r"^##SUMMARY:\s*(.+)$", re.M)
-_MARKER_CHECKLIST = re.compile(r"^##CHECKLIST:\s*\n(.*?)(?=^##|\Z)", re.M | re.S)
-_MARKER_NOTES = re.compile(r"^##NOTES:\s*\n(.*?)\Z", re.M | re.S)
-
-
-def _parse_review(text: str) -> dict | None:
-    v = _MARKER_VERDICT.search(text)
-    s = _MARKER_SUMMARY.search(text)
-    c = _MARKER_CHECKLIST.search(text)
-    n = _MARKER_NOTES.search(text)
-    if not (v and s and c):
-        return None
-    return {
-        "verdict": v.group(1),
-        "summary": s.group(1).strip(),
-        "checklist": c.group(1).strip(),
-        "notes": n.group(1).strip() if n else "",
-    }
+from ..lib.phase_runtime import isolated_worktree
+from ..lib.verdicts import ParseError, ReviewVerdict
 
 
 def _round_number(pr_number: int) -> int:
@@ -225,151 +202,151 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
               pr_number=pr_number, notes={"round": round_n, "persona": persona.name})
 
     branch = pr.get("headRefName", "")
-    worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"review-{pr_number}-r{round_n}", base="origin/main", as_cli=persona.cli)
-        subprocess.run(["git", "fetch", "origin", f"{branch}:{branch}", "--force"],
-                       cwd=worktree, check=True, capture_output=True)
-        subprocess.run(["git", "checkout", branch],
-                       cwd=worktree, check=True, capture_output=True)
+        with isolated_worktree(
+            f"review-{pr_number}-r{round_n}",
+            as_cli=persona.cli,
+            checkout_branch=branch,
+        ) as worktree:
+            issue_number = _extract_issue_ref(pr.get("body") or "")
+            issue_body = ""
+            if issue_number:
+                try:
+                    issue_body = (gh.get_issue(issue_number) or {}).get("body", "") or ""
+                except Exception:
+                    pass
 
-        issue_number = _extract_issue_ref(pr.get("body") or "")
-        issue_body = ""
-        if issue_number:
+            current_head = _head_sha(pr)
+            prior_head = review_baton.latest_head_sha(pr_number)
+            baton_context = ""
+            if review_baton.has_reviews(pr_number):
+                baton_context = review_baton.render(
+                    pr_number,
+                    current_head=current_head,
+                    delta_diff=_delta_diff(worktree, prior_head or "", current_head),
+                )
+
+            wrapper_facts = _wrapper_facts(
+                pr,
+                head_sha=current_head,
+                changed=changed,
+                bad_paths=bad_paths,
+                too_large=too_large,
+            )
+            prompt = _build_prompt(
+                persona,
+                pr,
+                issue_body,
+                wrapper_facts=wrapper_facts,
+                baton_context=baton_context,
+            )
+            run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
+
+            if run_.rate_limited:
+                db.append(phase="review", action="error", agent=persona.cli,
+                          pr_number=pr_number, duration_s=run_.duration_s,
+                          outcome="rate_limited",
+                          notes={"retry_after_ts": run_.retry_after_ts, "round": round_n})
+                return 1
+
+            if run_.timed_out:
+                db.append(phase="review", action="error", agent=persona.cli,
+                          pr_number=pr_number, duration_s=run_.duration_s,
+                          exit_code=run_.returncode, outcome="timed_out",
+                          notes={"round": round_n})
+                return 2
+
             try:
-                issue_body = (gh.get_issue(issue_number) or {}).get("body", "") or ""
-            except Exception:
-                pass
+                parsed = ReviewVerdict.parse(run_.final_message)
+            except ParseError as e:
+                if persona.on_parse_fail == "comment_and_retry":
+                    gh.comment(
+                        kind="pr", number=pr_number, as_cli=persona.cli,
+                        body=("⚠️ Reviewer agent produced unparseable output. Raw last message:\n\n"
+                              f"```\n{run_.final_message[:3000]}\n```"),
+                    )
+                db.append(phase="review", action="error", agent=persona.cli,
+                          pr_number=pr_number, duration_s=run_.duration_s,
+                          outcome="parse_failed", exit_code=run_.returncode,
+                          notes={"stdout_tail": run_.stdout[-1500:],
+                                 "stderr_tail": run_.stderr[-1500:],
+                                 "last_msg_len": len(run_.final_message),
+                                 "parse_error": str(e),
+                                 "round": round_n})
+                return 2
 
-        current_head = _head_sha(pr)
-        prior_head = review_baton.latest_head_sha(pr_number)
-        baton_context = ""
-        if review_baton.has_reviews(pr_number):
-            baton_context = review_baton.render(
-                pr_number,
-                current_head=current_head,
-                delta_diff=_delta_diff(worktree, prior_head or "", current_head),
+            # Wrapper-enforced overrides (reviewer cannot approve if these fail).
+            enforced_verdict = parsed.verdict
+            augmented_checklist = parsed.checklist
+            if bad_paths or too_large:
+                enforced_verdict = "REQUEST_CHANGES"
+                extra = []
+                if bad_paths:
+                    extra.append("**Protected-path violations** (wrapper-enforced):\n"
+                                 + "\n".join(f"- `{p}`" for p in bad_paths))
+                    gh.add_label(kind="pr", number=pr_number, label=s.label("protected_violation"), as_cli=persona.cli)
+                if too_large:
+                    extra.append(f"**Diff exceeds {s.max_diff_loc} LOC** (+{adds}/-{dels}, wrapper-enforced).")
+                    gh.add_label(kind="pr", number=pr_number, label=s.label("too_large"), as_cli=persona.cli)
+                augmented_checklist = "\n".join(extra) + "\n\n" + parsed.checklist
+
+            enforced = ReviewVerdict(
+                verdict=enforced_verdict,
+                summary=parsed.summary,
+                checklist=augmented_checklist,
+                notes=parsed.notes,
+            )
+            review_body = enforced.render() + (
+                f"\n---\n*Round {round_n}/{s.max_review_rounds} · "
+                f"reviewer: {persona.cli} · {time.strftime('%Y-%m-%d %H:%M')}*"
             )
 
-        wrapper_facts = _wrapper_facts(
-            pr,
-            head_sha=current_head,
-            changed=changed,
-            bad_paths=bad_paths,
-            too_large=too_large,
-        )
-        prompt = _build_prompt(
-            persona,
-            pr,
-            issue_body,
-            wrapper_facts=wrapper_facts,
-            baton_context=baton_context,
-        )
-        run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
+            verdict_to_flag = {
+                "APPROVE": "approve",
+                "REQUEST_CHANGES": "request-changes",
+                "COMMENT": "comment",
+            }
+            gh.review(pr_number=pr_number,
+                      verdict=verdict_to_flag[enforced_verdict],
+                      body=review_body,
+                      as_cli=persona.cli)
 
-        if run_.rate_limited:
-            db.append(phase="review", action="error", agent=persona.cli,
+            db.record_verdict(
+                pr_number=pr_number,
+                marker_type="review",
+                cli=persona.cli,
+                verdict=enforced_verdict,
+                head_sha=current_head,
+                round_n=round_n,
+                raw_body=review_body,
+            )
+
+            review_baton.append_review(
+                pr_number=pr_number,
+                head_sha=current_head,
+                reviewer=persona.cli,
+                round_n=round_n,
+                verdict=enforced_verdict,
+                summary=enforced.summary,
+                checklist=enforced.checklist,
+                notes=enforced.notes,
+                additions=adds,
+                deletions=dels,
+                changed_files=pr.get("changedFiles", 0),
+            )
+
+            db.append(phase="review", action="finish", agent=persona.cli,
                       pr_number=pr_number, duration_s=run_.duration_s,
-                      outcome="rate_limited",
-                      notes={"retry_after_ts": run_.retry_after_ts, "round": round_n})
-            return 1
-
-        if run_.timed_out:
-            db.append(phase="review", action="error", agent=persona.cli,
-                      pr_number=pr_number, duration_s=run_.duration_s,
-                      exit_code=run_.returncode, outcome="timed_out",
-                      notes={"round": round_n})
-            return 2
-
-        parsed = _parse_review(run_.final_message)
-        if not parsed:
-            if persona.on_parse_fail == "comment_and_retry":
-                gh.comment(
-                    kind="pr", number=pr_number, as_cli=persona.cli,
-                    body=("⚠️ Reviewer agent produced unparseable output. Raw last message:\n\n"
-                          f"```\n{run_.final_message[:3000]}\n```"),
-                )
-            db.append(phase="review", action="error", agent=persona.cli,
-                      pr_number=pr_number, duration_s=run_.duration_s,
-                      outcome="parse_failed", exit_code=run_.returncode,
-                      notes={"stdout_tail": run_.stdout[-1500:],
-                             "stderr_tail": run_.stderr[-1500:],
-                             "last_msg_len": len(run_.final_message),
-                             "round": round_n})
-            return 2
-
-        # Wrapper-enforced overrides (reviewer cannot approve if these fail).
-        enforced_verdict = parsed["verdict"]
-        if bad_paths or too_large:
-            enforced_verdict = "REQUEST_CHANGES"
-            extra = []
-            if bad_paths:
-                extra.append("**Protected-path violations** (wrapper-enforced):\n"
-                             + "\n".join(f"- `{p}`" for p in bad_paths))
-                gh.add_label(kind="pr", number=pr_number, label=s.label("protected_violation"), as_cli=persona.cli)
-            if too_large:
-                extra.append(f"**Diff exceeds {s.max_diff_loc} LOC** (+{adds}/-{dels}, wrapper-enforced).")
-                gh.add_label(kind="pr", number=pr_number, label=s.label("too_large"), as_cli=persona.cli)
-            parsed["checklist"] = "\n".join(extra) + "\n\n" + parsed["checklist"]
-
-        review_body = (
-            f"##VERDICT: {enforced_verdict}\n"
-            f"##SUMMARY: {parsed['summary']}\n"
-            f"##CHECKLIST:\n{parsed['checklist']}\n"
-            f"##NOTES:\n{parsed['notes']}\n"
-            f"\n---\n*Round {round_n}/{s.max_review_rounds} · reviewer: {persona.cli} · {time.strftime('%Y-%m-%d %H:%M')}*"
-        )
-
-        verdict_to_flag = {
-            "APPROVE": "approve",
-            "REQUEST_CHANGES": "request-changes",
-            "COMMENT": "comment",
-        }
-        gh.review(pr_number=pr_number,
-                  verdict=verdict_to_flag[enforced_verdict],
-                  body=review_body,
-                  as_cli=persona.cli)
-
-        review_baton.append_review(
-            pr_number=pr_number,
-            head_sha=current_head,
-            reviewer=persona.cli,
-            round_n=round_n,
-            verdict=enforced_verdict,
-            summary=parsed["summary"],
-            checklist=parsed["checklist"],
-            notes=parsed["notes"],
-            additions=adds,
-            deletions=dels,
-            changed_files=pr.get("changedFiles", 0),
-        )
-
-        review_baton.append_review(
-            pr_number=pr_number,
-            head_sha=current_head,
-            reviewer=persona.cli,
-            round_n=round_n,
-            verdict=enforced_verdict,
-            summary=parsed["summary"],
-            checklist=parsed["checklist"],
-            notes=parsed["notes"],
-            additions=adds,
-            deletions=dels,
-            changed_files=pr.get("changedFiles", 0),
-        )
-
-        db.append(phase="review", action="finish", agent=persona.cli,
-                  pr_number=pr_number, duration_s=run_.duration_s,
-                  outcome=enforced_verdict.lower(),
-                  notes={"round": round_n,
-                         "model_verdict": parsed["verdict"],
-                         "enforced_verdict": enforced_verdict,
-                         "protected_violations": bad_paths,
-                         "too_large": too_large,
-                         "baton_used": bool(baton_context),
-                         "head_sha": current_head,
-                         "persona": persona.name})
-        return 0
+                      outcome=enforced_verdict.lower(),
+                      notes={"round": round_n,
+                             "model_verdict": parsed.verdict,
+                             "enforced_verdict": enforced_verdict,
+                             "protected_violations": bad_paths,
+                             "too_large": too_large,
+                             "baton_used": bool(baton_context),
+                             "head_sha": current_head,
+                             "persona": persona.name})
+            return 0
 
     except kill_switch.HaltRequested as e:
         db.append(phase="review", action="halted", agent=persona.cli,
@@ -379,6 +356,3 @@ def review(pr_number: int, *, cli: str | None = None) -> int:
         db.append(phase="review", action="error", agent=persona.cli,
                   pr_number=pr_number, notes={"error": repr(e)})
         return 2
-    finally:
-        if worktree is not None:
-            git_worktree.cleanup(worktree, delete_branch=True)

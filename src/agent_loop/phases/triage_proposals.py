@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import re
 import time
-from pathlib import Path
 
 from ..config import settings
-from ..lib import agent_run, db, gh, git_worktree, kill_switch, quota, trust
+from ..lib import agent_run, db, gh, kill_switch, quota, trust
 from ..lib.persona import Persona
+from ..lib.phase_runtime import isolated_worktree
 
 
 _DECISION = re.compile(
@@ -62,63 +62,62 @@ def run() -> int:
               notes={"persona": persona.name, "n_proposals": len(proposals)})
 
     started = time.time()
-    worktree: Path | None = None
     try:
-        worktree = git_worktree.create(f"triage-{int(started)}", base="origin/main", as_cli=persona.cli)
-        prompt = persona.render(ISSUE_LIST=issue_list)
-        run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
-        duration = run_.duration_s
+        with isolated_worktree(f"triage-{int(started)}", as_cli=persona.cli) as worktree:
+            prompt = persona.render(ISSUE_LIST=issue_list)
+            run_ = agent_run.run_persona(persona, prompt=prompt, cwd=worktree)
+            duration = run_.duration_s
 
-        if run_.rate_limited:
-            db.append(phase="triage", action="error", agent=persona.cli,
-                      duration_s=duration, outcome="rate_limited",
-                      notes={"retry_after_ts": run_.retry_after_ts})
-            return 1
-        if run_.timed_out or run_.returncode != 0:
-            db.append(phase="triage", action="error", agent=persona.cli,
-                      exit_code=run_.returncode, duration_s=duration,
-                      outcome="timed_out" if run_.timed_out else "nonzero_exit",
-                      notes={"stderr": run_.stderr[-1500:]})
-            return 2
+            if run_.rate_limited:
+                db.append(phase="triage", action="error", agent=persona.cli,
+                          duration_s=duration, outcome="rate_limited",
+                          notes={"retry_after_ts": run_.retry_after_ts})
+                return 1
+            if run_.timed_out or run_.returncode != 0:
+                db.append(phase="triage", action="error", agent=persona.cli,
+                          exit_code=run_.returncode, duration_s=duration,
+                          outcome="timed_out" if run_.timed_out else "nonzero_exit",
+                          notes={"stderr": run_.stderr[-1500:]})
+                return 2
 
-        decisions = _parse_decisions(run_.final_message)
-        if not decisions:
-            db.append(phase="triage", action="error", agent=persona.cli,
-                      duration_s=duration, outcome="parse_failed",
-                      notes={"stdout_tail": run_.stdout[-500:]})
-            return 2
+            decisions = _parse_decisions(run_.final_message)
+            if not decisions:
+                db.append(phase="triage", action="error", agent=persona.cli,
+                          duration_s=duration, outcome="parse_failed",
+                          notes={"stdout_tail": run_.stdout[-500:]})
+                return 2
 
-        applied: list[dict] = []
-        for issue in proposals:
-            n = issue["number"]
-            if n not in decisions:
-                continue
-            decision, reason = decisions[n]
-            if decision == "approve" and not trust.issue_is_trusted(issue):
-                applied.append({"issue": n, "decision": "leave_for_human",
-                                "reason": "untrusted author; wrapper override",
-                                "model_decision": decision})
-                continue
-            try:
-                if decision == "approve":
-                    gh.remove_label(kind="issue", number=n, label=s.label("proposal"), as_cli=persona.cli)
-                    gh.add_label(kind="issue", number=n, label=s.label("approved"), as_cli=persona.cli)
-                    gh.comment(kind="issue", number=n, as_cli=persona.cli,
-                               body=f"🤖 Auto-approved by triage agent. Reason: {reason}")
-                elif decision == "reject":
-                    gh.comment(kind="issue", number=n, as_cli=persona.cli,
-                               body=f"🤖 Rejected by triage agent. Reason: {reason}")
-                    from ..lib.gh import _run  # type: ignore
-                    _run(["issue", "close", str(n)], as_cli=persona.cli)
-                applied.append({"issue": n, "decision": decision, "reason": reason})
-            except Exception as e:
-                applied.append({"issue": n, "decision": "error",
-                                "reason": repr(e), "model_decision": decision})
+            applied: list[dict] = []
+            for issue in proposals:
+                n = issue["number"]
+                if n not in decisions:
+                    continue
+                decision, reason = decisions[n]
+                if decision == "approve" and not trust.issue_is_trusted(issue):
+                    applied.append({"issue": n, "decision": "leave_for_human",
+                                    "reason": "untrusted author; wrapper override",
+                                    "model_decision": decision})
+                    continue
+                try:
+                    if decision == "approve":
+                        gh.remove_label(kind="issue", number=n, label=s.label("proposal"), as_cli=persona.cli)
+                        gh.add_label(kind="issue", number=n, label=s.label("approved"), as_cli=persona.cli)
+                        gh.comment(kind="issue", number=n, as_cli=persona.cli,
+                                   body=f"🤖 Auto-approved by triage agent. Reason: {reason}")
+                    elif decision == "reject":
+                        gh.comment(kind="issue", number=n, as_cli=persona.cli,
+                                   body=f"🤖 Rejected by triage agent. Reason: {reason}")
+                        from ..lib.gh import _run  # type: ignore
+                        _run(["issue", "close", str(n)], as_cli=persona.cli)
+                    applied.append({"issue": n, "decision": decision, "reason": reason})
+                except Exception as e:
+                    applied.append({"issue": n, "decision": "error",
+                                    "reason": repr(e), "model_decision": decision})
 
-        db.append(phase="triage", action="finish", agent=persona.cli,
-                  duration_s=duration, outcome="processed",
-                  notes={"count": len(applied), "decisions": applied})
-        return 0
+            db.append(phase="triage", action="finish", agent=persona.cli,
+                      duration_s=duration, outcome="processed",
+                      notes={"count": len(applied), "decisions": applied})
+            return 0
 
     except kill_switch.HaltRequested as e:
         db.append(phase="triage", action="halted", agent=persona.cli,
@@ -128,6 +127,3 @@ def run() -> int:
         db.append(phase="triage", action="error", agent=persona.cli,
                   notes={"error": repr(e)})
         return 2
-    finally:
-        if worktree is not None:
-            git_worktree.cleanup(worktree, delete_branch=True)

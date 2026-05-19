@@ -13,6 +13,7 @@ import re
 import sqlite3
 
 from . import gh, quota
+from .markers import Marker, Section, extract_inline
 from ..config import settings
 
 
@@ -43,10 +44,10 @@ def reviewer_verdicts(pr_number: int) -> dict[str, str]:
     # Arbiter overrides. Regex anchors to the `*arbiter: <cli>` trailer line so
     # prose mentions of "arbiter:" inside the verdict body can't be confused
     # with the agent identity.
-    arb_posts = gh.marker_posts(pr, marker="##ARBITER_VERDICT:")
+    arb_posts = gh.marker_posts(pr, marker=Marker.ARBITER)
     if arb_posts and arb_posts[-1]["ts"] > latest_commit_ts:
-        m = re.search(r"##ARBITER_VERDICT:\s*(\S+)", arb_posts[-1]["body"])
-        if m and m.group(1) == "APPROVE_FOR_MERGE":
+        arb_verdict = extract_inline(arb_posts[-1]["body"], Section.ARBITER_VERDICT)
+        if arb_verdict == "APPROVE_FOR_MERGE":
             m_arb_agent = re.search(r"\*arbiter:\s*(\w+)", arb_posts[-1]["body"])
             if m_arb_agent:
                 arb_agent = m_arb_agent.group(1)
@@ -58,10 +59,9 @@ def reviewer_verdicts(pr_number: int) -> dict[str, str]:
             break
         # Anchor to the `*Round N/M · reviewer: <cli>` trailer line.
         m_agent = re.search(r"\*Round\s+\d+/\d+\s*·\s*reviewer:\s*(\w+)", post["body"])
-        m_verdict = re.search(r"##VERDICT:\s*(\S+)", post["body"])
-        if m_agent and m_verdict:
+        verdict = extract_inline(post["body"], Section.VERDICT)
+        if m_agent and verdict:
             agent = m_agent.group(1)
-            verdict = m_verdict.group(1)
             if agent not in verdicts:
                 verdicts[agent] = verdict
 
